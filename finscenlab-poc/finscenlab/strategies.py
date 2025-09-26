@@ -94,8 +94,8 @@ class ValuationCash(IValuationStrategy):
             bal[t] += bal[t] * r_m  # Apply interest
 
         return BrickOutput(
-            cash_in=cash_in, 
-            cash_out=cash_out,
+            cash_in=np.zeros(T),  # Cash account doesn't generate cash flows, only receives them
+            cash_out=np.zeros(T), # Cash account doesn't generate cash outflows
             asset_value=bal, 
             debt_balance=np.zeros(T), 
             events=[]
