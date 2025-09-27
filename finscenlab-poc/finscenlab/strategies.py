@@ -219,75 +219,200 @@ class ValuationETFUnitized(IValuationStrategy):
     ETF investment valuation strategy (kind: 'a.invest.etf').
     
     This strategy models a unitized investment (like an ETF) with constant
-    price drift and optional dividend yield. The investment value is calculated
-    as units held multiplied by the current price, which grows at a constant rate.
+    price drift, optional dividend yield, and support for purchasing shares
+    through one-shot buys and dollar-cost averaging (DCA).
     
-    Required Parameters:
+    Key Features:
+        - Initial holdings (pre-owned units with no cash impact)
+        - One-shot buy at start (buy_at_start by amount or units)
+        - DCA plan by amount or units, with optional annual step-up
+        - Dividend reinvestment or cash distribution
+        - Configurable event logging
+        
+    Parameters:
         - initial_units: Number of units held at start (default: 0.0)
         - price0: Initial price per unit (default: 100.0)
         - drift_pa: Annual price drift rate (default: 0.03 for 3%)
         - div_yield_pa: Annual dividend yield (default: 0.0)
-        
-    Note:
-        This is a simplified model for proof-of-concept purposes. Real ETF
-        strategies would include more sophisticated price modeling, rebalancing,
-        and dividend handling.
+        - reinvest_dividends: Whether to reinvest dividends (default: False)
+        - buy_at_start: One-shot purchase {"amount": X} or {"units": Y}
+        - dca: DCA configuration with mode, amount/units, timing, and step-up
+        - round_units_to: Round units to N decimal places (optional)
+        - events_level: Event verbosity "none"|"major"|"all" (default: "major")
     """
     
     def prepare(self, brick: ABrick, ctx: ScenarioContext) -> None:
         """
         Prepare the ETF valuation strategy.
         
-        Sets up default parameters for the investment.
+        Sets up default parameters and validates the configuration.
         
         Args:
             brick: The ETF investment brick
             ctx: The simulation context
         """
-        brick.spec.setdefault("initial_units", 0.0)
-        brick.spec.setdefault("price0", 100.0)
-        brick.spec.setdefault("drift_pa", 0.03)   # 3% annual drift
-        brick.spec.setdefault("div_yield_pa", 0.0)
+        s = brick.spec
+        s.setdefault("initial_units", 0.0)
+        s.setdefault("price0", 100.0)
+        s.setdefault("drift_pa", 0.03)
+        s.setdefault("div_yield_pa", 0.0)
+        s.setdefault("reinvest_dividends", False)
+        s.setdefault("buy_at_start", None)      # {"amount": >0} or {"units": >0}
+        s.setdefault("dca", None)               # {"mode": "amount"|"units", ...}
+        s.setdefault("round_units_to", None)
+        s.setdefault("events_level", "major")   # "none"|"major"|"all"
+
+        # Validate DCA configuration
+        dca = s["dca"]
+        if dca is not None:
+            mode = dca.get("mode")
+            assert mode in ("amount", "units"), "dca.mode must be 'amount' or 'units'"
+            if mode == "amount":
+                assert dca.get("amount", 0) >= 0, "dca.amount must be >= 0"
+            else:
+                assert dca.get("units", 0) >= 0, "dca.units must be >= 0"
+            
+            # Normalize offsets
+            off = int(dca.get("start_offset_m", 0))
+            if off < 0:
+                dca["start_offset_m"] = 0
+                print(f"[WARN] {brick.id}: dca.start_offset_m < 0 -> clamped to 0")
+            dca.setdefault("months", None)
+            dca.setdefault("annual_step_pct", 0.0)
+
+        # Validate buy_at_start configuration
+        if s["buy_at_start"]:
+            bas = s["buy_at_start"]
+            assert ("amount" in bas) ^ ("units" in bas), "buy_at_start: provide exactly one of {'amount','units'}"
+            if "amount" in bas: 
+                assert bas["amount"] >= 0, "buy_at_start.amount must be >= 0"
+            if "units" in bas:  
+                assert bas["units"] >= 0, "buy_at_start.units must be >= 0"
 
     def simulate(self, brick: ABrick, ctx: ScenarioContext) -> BrickOutput:
         """
         Simulate the ETF investment over the time period.
         
-        Calculates the monthly price appreciation and generates dividend income
-        based on the current asset value. The investment value grows through
-        both price appreciation and dividend reinvestment.
+        Handles initial holdings, one-shot purchases, DCA contributions,
+        dividend payments/reinvestment, and price appreciation.
         
         Args:
             brick: The ETF investment brick
             ctx: The simulation context
             
         Returns:
-            BrickOutput with dividend income, asset value, and no events
+            BrickOutput with cash flows, asset value, and events
         """
         T = len(ctx.t_index)
-        units = np.full(T, float(brick.spec["initial_units"]))
-        price = np.zeros(T)
-        price[0] = float(brick.spec["price0"])
-        
-        # Calculate monthly drift and dividend rates
-        r_m  = (1 + float(brick.spec["drift_pa"])) ** (1/12) - 1
-        divm = float(brick.spec["div_yield_pa"]) / 12.0
+        s = brick.spec
+        cash_in  = np.zeros(T)    # dividends (if not reinvested)
+        cash_out = np.zeros(T)    # purchases
+        units    = np.zeros(T)
+        price    = np.zeros(T)
+        events   = []
 
-        # Calculate price appreciation over time
-        for t in range(1, T): 
+        # Price path calculation
+        r_m = (1 + float(s["drift_pa"])) ** (1/12) - 1
+        price[0] = float(s["price0"])
+        for t in range(1, T):
             price[t] = price[t-1] * (1 + r_m)
-        
-        # Calculate asset value and dividend income
+
+        # Initial holdings (pre-owned, no cash impact)
+        units[0] = float(s["initial_units"])
+
+        # One-shot buy at start (cash impact)
+        buy0 = s.get("buy_at_start")
+        if buy0:
+            if "amount" in buy0 and buy0["amount"] > 0:
+                amt = float(buy0["amount"])
+                add_u = amt / price[0]
+                units[0] += add_u
+                cash_out[0] += amt
+                if s.get("events_level") in ("major", "all"):
+                    events.append(Event(ctx.t_index[0], "buy_start",
+                                        f"ETF buy at start: €{amt:,.2f}",
+                                        {"amount": amt, "units": add_u, "price": price[0]}))
+            elif "units" in buy0 and buy0["units"] > 0:
+                u = float(buy0["units"])
+                amt = u * price[0]
+                units[0] += u
+                cash_out[0] += amt
+                if s.get("events_level") in ("major", "all"):
+                    events.append(Event(ctx.t_index[0], "buy_start",
+                                        f"ETF buy at start: {u:,.6f}u",
+                                        {"amount": amt, "units": u, "price": price[0]}))
+
+        # Extract configuration for monthly loop
+        divm = float(s["div_yield_pa"]) / 12.0
+        reinv = bool(s["reinvest_dividends"])
+        round_to = s.get("round_units_to")
+        dca = s.get("dca")
+        ev_lvl = s.get("events_level")
+
+        # Monthly loop for dividends & DCA
+        for t in range(T):
+            # Carry forward units
+            if t > 0:
+                units[t] = units[t-1]
+
+            # Dividends BEFORE DCA (based on units at start of month)
+            if divm > 0:
+                dv = units[t] * price[t] * divm
+                if reinv and dv > 0:
+                    add_u = dv / price[t]
+                    units[t] += add_u
+                    if ev_lvl in ("major", "all"):
+                        events.append(Event(ctx.t_index[t], "div_reinvest",
+                                            f"Dividends reinvested: €{dv:,.2f}",
+                                            {"amount": dv, "units": add_u, "price": price[t]}))
+                else:
+                    cash_in[t] += dv
+                    if ev_lvl in ("major", "all") and dv > 0:
+                        events.append(Event(ctx.t_index[t], "div_cash",
+                                            f"Dividends to cash: €{dv:,.2f}",
+                                            {"amount": dv, "price": price[t]}))
+
+            # DCA AFTER dividends
+            if dca is not None:
+                start_off = int(dca.get("start_offset_m", 0))
+                months = dca.get("months", None)
+                m_rel = t - start_off
+                if m_rel >= 0 and (months is None or m_rel < int(months)):
+                    if dca["mode"] == "amount":
+                        step_blocks = max(0, m_rel // 12)
+                        amt = float(dca["amount"]) * ((1 + float(dca.get("annual_step_pct", 0.0))) ** step_blocks)
+                        if amt > 0:
+                            add_u = amt / price[t]
+                            units[t] += add_u
+                            cash_out[t] += amt
+                            if ev_lvl == "all":
+                                events.append(Event(ctx.t_index[t], "dca_amount",
+                                                    f"DCA (amount): €{amt:,.2f}",
+                                                    {"amount": amt, "units": add_u, "price": price[t]}))
+                    else:  # units mode
+                        u = float(dca["units"])
+                        if u > 0:
+                            amt = u * price[t]  # Use current month's price
+                            units[t] += u
+                            cash_out[t] += amt
+                            if ev_lvl == "all":
+                                events.append(Event(ctx.t_index[t], "dca_units",
+                                                    f"DCA (units): {u:,.6f}u",
+                                                    {"amount": amt, "units": u, "price": price[t]}))
+
+            # Round units after all operations for the month
+            if round_to is not None:
+                units[t] = np.round(units[t], int(round_to))
+
+        # Calculate final asset values
         asset_value = units * price
-        cash_in  = divm * asset_value  # Monthly dividend income
-        cash_out = np.zeros(T)
 
         return BrickOutput(
-            cash_in=cash_in, 
+            cash_in=cash_in,
             cash_out=cash_out,
-            asset_value=asset_value, 
+            asset_value=asset_value,
             debt_balance=np.zeros(T),
-            events=[]
+            events=events
         )
 
 # ---------- Liability Schedule Strategies ----------
