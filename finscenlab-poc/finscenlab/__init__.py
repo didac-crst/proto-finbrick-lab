@@ -82,8 +82,12 @@ from .core import (
     Scenario,
     ScenarioContext,
     BrickOutput,
+    Event,
     month_range,
     wire_strategies,
+    validate_run,
+    export_run_json,
+    export_ledger_csv,
     ValuationRegistry,
     ScheduleRegistry,
     FlowRegistry
@@ -96,7 +100,8 @@ from .core import (
     IFlowStrategy
 )
 
-# Import strategies module to register defaults
+# Import kinds and strategies modules
+from . import kinds
 import finscenlab.strategies
 
 # Define what gets imported with "from finscenlab import *"
@@ -109,10 +114,14 @@ __all__ = [
     "Scenario",
     "ScenarioContext",
     "BrickOutput",
+    "Event",
     
     # Utility functions
     "month_range",
     "wire_strategies",
+    "validate_run",
+    "export_run_json",
+    "export_ledger_csv",
     
     # Strategy interfaces
     "IValuationStrategy",
@@ -123,6 +132,9 @@ __all__ = [
     "ValuationRegistry",
     "ScheduleRegistry",
     "FlowRegistry",
+    
+    # Kind constants
+    "kinds",
     
     # Version info
     "__version__",

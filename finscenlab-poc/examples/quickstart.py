@@ -12,7 +12,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import the core components
 from datetime import date
-from finscenlab.core import Scenario, ABrick, LBrick, FBrick
+from finscenlab.core import Scenario, ABrick, LBrick, FBrick, validate_run
+from finscenlab.kinds import K
 import finscenlab.strategies  # This registers the default strategies
 
 print("✅ All imports successful!")
@@ -24,7 +25,7 @@ print("\n🏗️  Creating financial bricks...")
 cash = ABrick(
     id="cash:EUR", 
     name="Main Cash Account", 
-    kind="a.cash",
+    kind=K.A_CASH,  # Using kind constants!
     spec={
         "initial_balance": 0.0, 
         "interest_pa": 0.02  # 2% annual interest
@@ -35,7 +36,7 @@ cash = ABrick(
 seed = FBrick(
     id="seed", 
     name="Owner Equity Seed", 
-    kind="f.transfer.lumpsum",
+    kind=K.F_TRANSFER,  # Using kind constants!
     spec={"amount": 100_000}
 )
 
@@ -61,6 +62,14 @@ print("✅ Simulation completed!")
 print(f"   Period: {results['totals'].index[0]} to {results['totals'].index[-1]}")
 print(f"   Months: {len(results['totals'])}")
 
+# Validate the results
+print("\n🔍 Validating results...")
+try:
+    validate_run(results, mode="raise")
+    print("✅ All validation checks passed!")
+except AssertionError as e:
+    print(f"❌ Validation failed: {e}")
+
 # Show the results
 print("\n📊 Results Summary:")
 print("=" * 50)
@@ -84,10 +93,11 @@ print(f"  Assets:   €{last_month['assets']:,.2f}")
 print(f"  Equity:   €{last_month['equity']:,.2f}")
 
 # Show the seed money event
-print(f"\n📝 Events:")
+print(f"\n📝 Time-Stamped Events:")
 for brick_id, output in results['outputs'].items():
     if output['events']:
-        print(f"  {brick_id}: {output['events'][0]}")
+        for event in output['events']:
+            print(f"  {event.t}: {brick_id} [{event.kind}] - {event.message}")
 
 print("\n✅ Demo completed successfully!")
 print("\nThis shows:")

@@ -21,10 +21,11 @@ Architecture Benefits:
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Protocol, TypedDict, Dict, List, Optional, Callable
+from typing import Protocol, TypedDict, Dict, List, Optional, Callable, NamedTuple, Any
 from datetime import date
 import numpy as np
 import pandas as pd
+import copy
 
 # ---------- time utilities ----------
 
@@ -49,7 +50,25 @@ def month_range(start: date, months: int) -> np.ndarray:
     s = np.datetime64(start, 'M')
     return s + np.arange(months).astype('timedelta64[M]')
 
-# ---------- common output structure for ALL bricks ----------
+# ---------- event and output structures ----------
+
+class Event(NamedTuple):
+    """
+    Time-stamped event record for financial brick simulations.
+    
+    Events provide a structured way to track important occurrences during
+    simulation, with timestamps aligned to the simulation time index.
+    
+    Attributes:
+        t: The month when the event occurred (np.datetime64[M])
+        kind: Event type identifier (e.g., 'purchase', 'fees', 'loan_draw', 'payment')
+        message: Human-readable description of the event
+        meta: Optional dictionary with additional event metadata
+    """
+    t: np.datetime64          # Month when event occurred
+    kind: str                 # Event type identifier
+    message: str              # Human-readable description
+    meta: Optional[Dict[str, Any]] = None  # Additional metadata
 
 class BrickOutput(TypedDict):
     """
@@ -64,17 +83,18 @@ class BrickOutput(TypedDict):
         cash_out: Monthly cash outflows (always >= 0)  
         asset_value: Monthly asset valuation (0 for non-assets)
         debt_balance: Monthly debt balance (0 for non-liabilities)
-        events: List of textual notes describing key events during simulation
+        events: List of time-stamped events describing key occurrences
         
     Note:
         All numpy arrays have the same length corresponding to the simulation period.
         Cash flows are always positive values - the direction is implicit in the field name.
+        Events are time-stamped and can be used to build a simulation ledger.
     """
     cash_in: np.ndarray        # Monthly cash inflows (>=0)
     cash_out: np.ndarray       # Monthly cash outflows (>=0)
     asset_value: np.ndarray    # Monthly asset value (0 if not an asset)
     debt_balance: np.ndarray   # Monthly debt balance (0 if not a liability)
-    events: List[str]          # Textual notes describing key events
+    events: List[Event]        # Time-stamped events describing key occurrences
 
 # ---------- simulation context ----------
 
@@ -250,10 +270,14 @@ class FinBrickABC:
         spec: Dictionary containing strategy-specific parameters
         links: Dictionary for referencing other bricks (e.g., {'auto_principal_from': 'house_id'})
         family: Brick family type ('a' for assets, 'l' for liabilities, 'f' for flows)
+        start_date: Optional start date for the brick (default: None = starts at scenario start)
         
     Note:
         The 'family' attribute is automatically set by subclasses and should not be
         specified manually when creating brick instances.
+        
+        The 'start_date' allows bricks to activate at specific times during the simulation,
+        enabling scenarios like buying a house in 2028 or starting a new job in 2025.
     """
     id: str
     name: str
@@ -262,6 +286,7 @@ class FinBrickABC:
     spec: dict = None     # Strategy-specific parameters
     links: dict = None    # References to other bricks
     family: str = None    # 'a' | 'l' | 'f' - set automatically in subclasses
+    start_date: Optional[date] = None  # When this brick becomes active
 
     def prepare(self, ctx: ScenarioContext) -> None:
         """
@@ -470,9 +495,14 @@ def wire_strategies(bricks: List[FinBrickABC]) -> None:
         
     Note:
         This function modifies the bricks in-place by setting their strategy
-        attributes (valuation, schedule, or flow).
+        attributes (valuation, schedule, or flow). It also creates deep copies
+        of brick specs to ensure per-run isolation and prevent accidental
+        carry-over between simulation runs.
     """
     for b in bricks:
+        # Create deep copy of spec for per-run isolation
+        b.spec = copy.deepcopy(b.spec or {})
+        
         if isinstance(b, ABrick):
             assert b.kind in ValuationRegistry, f"Unknown asset kind: {b.kind}"
             b.valuation = ValuationRegistry[b.kind]
@@ -513,7 +543,7 @@ class Scenario:
     bricks: List[FinBrickABC]
     currency: str = "EUR"
 
-    def run(self, start: date, months: int) -> dict:
+    def run(self, start: date, months: int, include_cash: bool = True) -> dict:
         """
         Run the complete financial scenario simulation.
         
@@ -566,10 +596,32 @@ class Scenario:
         for b in self.bricks:
             if b.id == cash_id: 
                 continue  # Skip cash account for now
-            out = b.simulate(ctx)
-            outputs[b.id] = out
-            routed_in  += out["cash_in"]
-            routed_out += out["cash_out"]
+            
+            # Handle delayed brick activation
+            if b.start_date is not None:
+                # Find the start index for this brick
+                start_idx = self._find_start_index(b.start_date, t_index)
+                if start_idx is None:
+                    # Brick starts after simulation period, skip it
+                    continue
+            else:
+                start_idx = 0  # Brick starts at beginning of simulation
+            
+            # Create a modified context for this brick with delayed start
+            brick_ctx = self._create_delayed_context(ctx, start_idx)
+            
+            out = b.simulate(brick_ctx)
+            
+            # Shift the output arrays to the correct time positions
+            if start_idx > 0:
+                shifted_out = self._shift_output(out, start_idx, len(t_index))
+                outputs[b.id] = shifted_out
+                routed_in  += shifted_out["cash_in"]
+                routed_out += shifted_out["cash_out"]
+            else:
+                outputs[b.id] = out
+                routed_in  += out["cash_in"]
+                routed_out += out["cash_out"]
 
         # Route accumulated cash flows to the cash account
         cash_brick = ctx.registry[cash_id]
@@ -600,4 +652,423 @@ class Scenario:
             "equity": equity
         }).set_index("t")
         
-        return {"outputs": outputs, "totals": totals}
+        # Add cash column if requested
+        if include_cash:
+            from .kinds import K
+            cash_series = None
+            for b in self.bricks:
+                if isinstance(b, ABrick) and b.kind == K.A_CASH:
+                    s = outputs[b.id]["asset_value"]
+                    cash_series = s if cash_series is None else (cash_series + s)
+            if cash_series is not None:
+                totals["cash"] = cash_series
+        
+        return {"outputs": outputs, "totals": totals, "_scenario_bricks": self.bricks}
+    
+    def _find_start_index(self, start_date: date, t_index: np.ndarray) -> Optional[int]:
+        """
+        Find the index in t_index that corresponds to the start_date.
+        
+        Args:
+            start_date: The date when the brick should start
+            t_index: The time index array
+            
+        Returns:
+            The index where the brick should start, or None if after simulation period
+        """
+        start_datetime64 = np.datetime64(start_date, 'M')
+        
+        # Find the first index where t_index >= start_date
+        for i, t in enumerate(t_index):
+            if t >= start_datetime64:
+                return i
+        
+        return None  # start_date is after simulation period
+    
+    def _create_delayed_context(self, ctx: ScenarioContext, start_idx: int) -> ScenarioContext:
+        """
+        Create a modified context for a brick that starts at a delayed time.
+        
+        Args:
+            ctx: The original simulation context
+            start_idx: The index where the brick starts
+            
+        Returns:
+            A new context with time index starting from start_idx
+        """
+        # Create a new time index starting from the brick's start time
+        new_t_index = ctx.t_index[start_idx:]
+        
+        return ScenarioContext(
+            t_index=new_t_index,
+            currency=ctx.currency,
+            registry=ctx.registry
+        )
+    
+    def _shift_output(self, output: BrickOutput, start_idx: int, total_length: int) -> BrickOutput:
+        """
+        Shift a brick's output to start at the correct time index.
+        
+        Args:
+            output: The brick's output
+            start_idx: The index where the brick starts
+            total_length: The total length of the simulation
+            
+        Returns:
+            A new BrickOutput with arrays padded with zeros at the beginning
+        """
+        # Create arrays of the full simulation length
+        full_cash_in = np.zeros(total_length)
+        full_cash_out = np.zeros(total_length)
+        full_asset_value = np.zeros(total_length)
+        full_debt_balance = np.zeros(total_length)
+        
+        # Place the brick's output at the correct time positions
+        brick_length = len(output["cash_in"])
+        end_idx = min(start_idx + brick_length, total_length)
+        actual_length = end_idx - start_idx
+        
+        full_cash_in[start_idx:end_idx] = output["cash_in"][:actual_length]
+        full_cash_out[start_idx:end_idx] = output["cash_out"][:actual_length]
+        full_asset_value[start_idx:end_idx] = output["asset_value"][:actual_length]
+        full_debt_balance[start_idx:end_idx] = output["debt_balance"][:actual_length]
+        
+        return BrickOutput(
+            cash_in=full_cash_in,
+            cash_out=full_cash_out,
+            asset_value=full_asset_value,
+            debt_balance=full_debt_balance,
+            events=output["events"]  # Events don't need shifting
+        )
+
+# ---------- validation utilities ----------
+
+def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6) -> None:
+    """
+    Validate simulation results against key financial invariants.
+    
+    This function performs several consistency checks on the simulation results
+    to catch potential bugs or modeling errors. It can either raise exceptions
+    or issue warnings based on the mode parameter.
+    
+    Args:
+        res: The results dictionary returned by Scenario.run()
+        mode: Validation mode - 'raise' to raise AssertionError on failures,
+              'warn' to print warnings instead
+        tol: Numerical tolerance for floating-point comparisons
+              
+    Raises:
+        AssertionError: If validation fails and mode='raise'
+        
+    Note:
+        The validation checks include:
+        - Equity identity: equity = assets - debt
+        - Debt monotonicity: debt should not increase after initial draws
+        - Cash flow consistency: net_cf = cash_in - cash_out
+    """
+    totals = res["totals"]
+    outputs = res["outputs"]
+    
+    # 1) Identity checks
+    fails = []
+    
+    # Equity identity: equity = assets - debt
+    if not np.allclose(totals["equity"].values, (totals["assets"] - totals["debt"]).values, atol=tol):
+        fails.append("equity != assets - debt")
+    
+    # Cash flow consistency: net_cf = cash_in - cash_out
+    if not np.allclose(totals["net_cf"].values, (totals["cash_in"] - totals["cash_out"]).values, atol=tol):
+        fails.append("net_cf != cash_in - cash_out")
+    
+    # Debt monotonicity: debt should not increase after initial draws
+    debt = totals["debt"].values
+    if len(debt) > 1 and not np.all(np.diff(debt[1:]) <= tol):
+        fails.append("debt increased after t0")
+    
+    # 4) Purchase settlement validation (if applicable)
+    purchase_ok = True
+    purchase_messages = []
+    
+    # Check for property purchases and their settlement
+    for brick_id, output in res["outputs"].items():
+        # Look for property bricks that have cash_out at t=0
+        if output["cash_out"][0] > 1e-6:  # Has cash outflow at t=0
+            # This might be a property purchase - check if it's reasonable
+            cash_out_t0 = output["cash_out"][0]
+            
+            # Find the corresponding brick to get its spec
+            brick = None
+            for b in res.get("_scenario_bricks", []):
+                if b.id == brick_id:
+                    brick = b
+                    break
+            
+            if brick and hasattr(brick, 'spec') and "price" in brick.spec:
+                price = float(brick.spec["price"])
+                fees_pct = float(brick.spec.get("fees_pct", 0.0))
+                fees = price * fees_pct
+                fees_fin_pct = float(brick.spec.get("fees_financed_pct", 1.0 if brick.spec.get("finance_fees") else 0.0))
+                fees_cash = fees * (1.0 - fees_fin_pct)
+                expected_cash_out = price + fees_cash
+                
+                if abs(cash_out_t0 - expected_cash_out) > tol:
+                    purchase_ok = False
+                    purchase_messages.append(f"{brick_id} cash_out[t0] = €{cash_out_t0:,.2f}, expected €{expected_cash_out:,.2f}")
+    
+    if not purchase_ok:
+        fails.append("purchase settlement mismatch: " + "; ".join(purchase_messages))
+    
+    # 5) Liquidity constraints (only if we have bricks)
+    if bricks is not None:
+        from .kinds import K
+        for b in bricks:
+            if isinstance(b, ABrick) and b.kind == K.A_CASH:
+                bal = outputs[b.id]["asset_value"]
+                overdraft = float((b.spec or {}).get("overdraft_limit", 0.0))
+                minbuf = float((b.spec or {}).get("min_buffer", 0.0))
+                
+                # Overdraft breach
+                if (bal < -overdraft - tol).any():
+                    t_idx = int(np.where(bal < -overdraft - tol)[0][0])
+                    amt = float(bal[t_idx])
+                    msg = (f"Liquidity breach: cash '{b.id}' = {amt:,.2f} < overdraft_limit {overdraft:,.2f}. "
+                           f"Suggest: top-up ≥ {abs(amt+overdraft):,.2f} or reduce t₀ outflows / finance fees.")
+                    fails.append(msg)
+                
+                # Buffer breach
+                if (bal < minbuf - tol).any():
+                    t_idx = int(np.where(bal < minbuf - tol)[0][0])
+                    amt = float(bal[t_idx])
+                    msg = (f"Buffer breach: cash '{b.id}' = {amt:,.2f} < min_buffer {minbuf:,.2f}. "
+                           f"Suggest: top-up ≥ {minbuf-amt:,.2f} or lower min_buffer.")
+                    fails.append(msg)
+    
+    # Handle failures
+    if fails:
+        full = "Run validation failed: " + " | ".join(fails)
+        if mode == "raise":
+            raise AssertionError(full)
+        else:
+            print(f"WARNING: {full}")
+
+# ---------- enhanced export utilities ----------
+
+def export_run_json(path: str, scenario: Scenario, res: dict, include_specs: bool = False, precision: int = 2) -> None:
+    """
+    Export simulation results to a comprehensive JSON format.
+    
+    This function creates a structured JSON export that includes:
+    - Scenario metadata and brick definitions
+    - Time series data for all bricks
+    - Time-stamped events with metadata
+    - Aggregated totals
+    - Validation results and invariants
+    
+    Args:
+        path: Output file path for the JSON file
+        scenario: The scenario that was run
+        res: Results dictionary from Scenario.run()
+        include_specs: Whether to include brick specifications in the export
+        precision: Number of decimal places for numeric values
+    """
+    import json
+    import numpy as np
+    
+    # Convert time index to string format
+    t_index = res["totals"].index.strftime("%Y-%m").tolist()
+    
+    # Extract series data for all bricks
+    series = {}
+    for brick_id, output in res["outputs"].items():
+        series[brick_id] = {}
+        for key in ["cash_in", "cash_out", "asset_value", "debt_balance"]:
+            if key in output:
+                # Convert to list and round to specified precision
+                if hasattr(output[key], "tolist"):
+                    values = output[key].tolist()
+                elif isinstance(output[key], (list, tuple)):
+                    values = list(output[key])
+                else:
+                    values = [output[key]]
+                
+                if precision >= 0:
+                    values = [round(v, precision) if isinstance(v, (int, float)) else v for v in values]
+                series[brick_id][key] = values
+    
+    # Extract and format events
+    events = []
+    for brick_id, output in res["outputs"].items():
+        for event in output.get("events", []):
+            event_data = {
+                "t": str(event.t.astype("datetime64[M]")),
+                "brick_id": brick_id,
+                "kind": event.kind,
+                "message": event.message,
+                "meta": event.meta or {}
+            }
+            # Add amount if available in meta
+            if event.meta and "amount" in event.meta:
+                event_data["amount"] = round(event.meta["amount"], precision)
+            events.append(event_data)
+    
+    # Sort events by time
+    events.sort(key=lambda x: x["t"])
+    
+    # Extract totals with precision
+    totals = {}
+    for col in res["totals"].columns:
+        if hasattr(res["totals"][col], "tolist"):
+            values = res["totals"][col].tolist()
+        else:
+            values = list(res["totals"][col])
+        
+        if precision >= 0:
+            values = [round(v, precision) if isinstance(v, (int, float)) else v for v in values]
+        totals[col] = values
+    
+    # Run validation and capture results
+    validation_results = {}
+    try:
+        # Capture validation output
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = buffer = io.StringIO()
+        
+        validate_run(res, mode="warn", tol=1e-6)
+        
+        sys.stdout = old_stdout
+        validation_output = buffer.getvalue()
+        
+        # Parse validation results
+        validation_results = {
+            "equity_identity": "equity != assets - debt" not in validation_output,
+            "debt_monotone": "debt increased after initial draws" not in validation_output,
+            "cash_flow_consistent": "net_cf != cash_in - cash_out" not in validation_output,
+            "purchase_settlement_ok": "purchase settlement mismatch" not in validation_output,
+            "messages": [line.strip() for line in validation_output.split('\n') if line.strip() and "WARNING:" in line]
+        }
+    except Exception as e:
+        validation_results = {
+            "error": str(e),
+            "equity_identity": False,
+            "debt_monotone": False,
+            "cash_flow_consistent": False,
+            "purchase_settlement_ok": False,
+            "messages": [f"Validation error: {str(e)}"]
+        }
+    
+    # Build the comprehensive JSON structure
+    payload = {
+        "metadata": {
+            "scenario": {
+                "id": scenario.id,
+                "name": scenario.name
+            },
+            "simulation_period": {
+                "start": t_index[0],
+                "end": t_index[-1],
+                "months": len(t_index)
+            },
+            "bricks": [
+                {
+                    "id": brick.id,
+                    "name": brick.name,
+                    "family": brick.family,
+                    "kind": brick.kind,
+                    "start_date": str(brick.start_date) if brick.start_date else None
+                }
+                for brick in scenario.bricks
+            ]
+        },
+        "t_index": t_index,
+        "series": series,
+        "events": events,
+        "totals": totals,
+        "invariants": validation_results
+    }
+    
+    # Optionally include brick specifications
+    if include_specs:
+        payload["brick_specs"] = {
+            brick.id: {
+                "spec": brick.spec,
+                "links": brick.links
+            }
+            for brick in scenario.bricks
+        }
+    
+    # Custom JSON encoder to handle numpy types
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif hasattr(obj, 'tolist'):
+                return obj.tolist()
+            return super(NumpyEncoder, self).default(obj)
+    
+    # Write to file
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+
+def export_ledger_csv(path: str, res: dict) -> None:
+    """
+    Export simulation results to a flat ledger CSV format.
+    
+    This creates a simple CSV with one row per cash flow or event,
+    making it easy to eyeball the financial transactions.
+    
+    Args:
+        path: Output file path for the CSV file
+        res: Results dictionary from Scenario.run()
+    """
+    import csv
+    
+    t_index = res["totals"].index
+    rows = []
+    
+    # Extract cash flows
+    for brick_id, output in res["outputs"].items():
+        for flow_type in ["cash_in", "cash_out"]:
+            arr = output[flow_type]
+            for i, val in enumerate(arr):
+                if abs(val) > 1e-9:  # Only include non-zero flows
+                    rows.append({
+                        "t": t_index[i].strftime("%Y-%m"),
+                        "brick_id": brick_id,
+                        "flow": flow_type,
+                        "amount": float(val),
+                        "note": ""
+                    })
+    
+    # Extract events
+    for brick_id, output in res["outputs"].items():
+        for event in output.get("events", []):
+            amount = 0.0
+            if event.meta and "amount" in event.meta:
+                amount = float(event.meta["amount"])
+            elif event.meta and "price" in event.meta:
+                amount = float(event.meta["price"])
+            elif event.meta and "principal" in event.meta:
+                amount = float(event.meta["principal"])
+            
+            rows.append({
+                "t": str(event.t.astype("datetime64[M]")),
+                "brick_id": brick_id,
+                "flow": f"event:{event.kind}",
+                "amount": amount,
+                "note": event.message
+            })
+    
+    # Sort by time
+    rows.sort(key=lambda x: x["t"])
+    
+    # Write to CSV
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["t", "brick_id", "flow", "amount", "note"])
+        writer.writeheader()
+        writer.writerows(rows)

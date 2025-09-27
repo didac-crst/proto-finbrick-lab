@@ -24,6 +24,7 @@ Key Features:
 from __future__ import annotations
 import numpy as np
 from .core import *
+from .kinds import K
 
 # ---------- Asset Valuation Strategies ----------
 
@@ -52,7 +53,7 @@ class ValuationCash(IValuationStrategy):
         """
         Prepare the cash account strategy.
         
-        Sets up default parameters and validates the configuration.
+        Sets up default parameters, liquidity policy, and validates the configuration.
         
         Args:
             brick: The cash account brick
@@ -62,6 +63,19 @@ class ValuationCash(IValuationStrategy):
         brick.spec.setdefault("interest_pa", 0.0)
         brick.spec.setdefault("external_in",  np.zeros(len(ctx.t_index)))
         brick.spec.setdefault("external_out", np.zeros(len(ctx.t_index)))
+        
+        # Set liquidity policy defaults
+        brick.spec.setdefault("overdraft_limit", 0.0)  # how far below 0 cash may go (EUR)
+        brick.spec.setdefault("min_buffer", 0.0)       # desired minimum cash balance (EUR)
+        
+        # Validate non-negative constraints
+        assert brick.spec["overdraft_limit"] >= 0, "overdraft_limit must be >= 0"
+        assert brick.spec["min_buffer"] >= 0, "min_buffer must be >= 0"
+        
+        # Warn if min_buffer > initial_balance (policy breach, not config error)
+        initial_balance = brick.spec.get("initial_balance", 0.0)
+        if brick.spec["min_buffer"] > initial_balance:
+            print(f"[WARN] {brick.id}: min_buffer ({brick.spec['min_buffer']:,.2f}) > initial_balance ({initial_balance:,.2f}).")
 
     def simulate(self, brick: ABrick, ctx: ScenarioContext) -> BrickOutput:
         """
@@ -163,12 +177,14 @@ class ValuationPropertyDiscrete(IValuationStrategy):
         # Extract parameters
         price = float(brick.spec["price"])
         fees  = price * float(brick.spec["fees_pct"])
-        finance_fees = bool(brick.spec.get("finance_fees", False))
+        
+        # Calculate fees financing (new logic with percentage support)
+        fees_fin_pct = float(brick.spec.get("fees_financed_pct", 1.0 if brick.spec.get("finance_fees") else 0.0))
+        fees_fin_pct = max(0.0, min(1.0, fees_fin_pct))  # Clamp to [0,1]
+        fees_cash = fees * (1.0 - fees_fin_pct)
 
-        # Settlement at t=0: pay seller + fees (if not financed)
-        cash_out[0] += price
-        if not finance_fees: 
-            cash_out[0] += fees
+        # t0 settlement: pay seller + cash portion of fees ONCE
+        cash_out[0] = price + fees_cash
 
         # Calculate monthly appreciation rate
         r_m = (1 + float(brick.spec["appreciation_pa"])) ** (1/12) - 1
@@ -178,12 +194,24 @@ class ValuationPropertyDiscrete(IValuationStrategy):
         for t in range(1, T): 
             value[t] = value[t-1] * (1 + r_m)
 
+        
+        # Create time-stamped events
+        events = [
+            Event(ctx.t_index[0], "purchase", f"Purchase {brick.name}", {"price": price}),
+        ]
+        if fees_cash > 0:
+            events.append(Event(ctx.t_index[0], "fees_cash", f"Fees paid from cash: €{fees_cash:,.2f}",
+                                {"fees": fees, "fees_cash": fees_cash}))
+        if fees_fin_pct > 0:
+            events.append(Event(ctx.t_index[0], "fees_financed", f"Fees financed: €{fees * fees_fin_pct:,.2f}",
+                                {"fees": fees, "fees_financed": fees * fees_fin_pct}))
+
         return BrickOutput(
             cash_in=cash_in, 
             cash_out=cash_out,
             asset_value=value, 
             debt_balance=np.zeros(T),
-            events=[f"t0: Purchase {brick.name} - Price: €{price:,.2f}, Fees: €{fees:,.2f}"]
+            events=events
         )
 
 class ValuationETFUnitized(IValuationStrategy):
@@ -301,17 +329,40 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
         """
         # Auto-calculate principal from linked property if not provided
         if "principal" not in brick.spec:
-            auto_from = brick.links.get("auto_principal_from")
+            auto_from = (brick.links or {}).get("auto_principal_from")
             assert auto_from in ctx.registry, "auto_principal_from link missing or invalid"
             prop: ABrick = ctx.registry[auto_from]  # type: ignore
+            
             price = float(prop.spec["price"])
-            down  = float(prop.spec.get("down_payment", 0.0))
-            brick.spec["principal"] = price - down
+            down = float(prop.spec.get("down_payment", 0.0))
+            fees_pct = float(prop.spec.get("fees_pct", 0.0))
+            fees = price * fees_pct
+            
+            # Handle fees financing
+            finance_fees = bool(prop.spec.get("finance_fees", False))
+            fees_fin_pct = float(prop.spec.get("fees_financed_pct", 1.0 if finance_fees else 0.0))
+            fees_fin_pct = max(0.0, min(1.0, fees_fin_pct))  # Clamp to [0,1]
+            fees_financed = fees * fees_fin_pct
+            
+            # Calculate principal: price - down_payment + financed_fees
+            principal = price - down + fees_financed
+            brick.spec["principal"] = principal
+            
+            # Store derived values for logging/validation
+            brick.spec["_derived"] = {
+                "price": price,
+                "down_payment": down,
+                "fees": fees,
+                "fees_financed": fees_financed
+            }
         
         # Validate all required parameters
         required_params = ["rate_pa", "term_months", "principal"]
         for param in required_params: 
             assert param in brick.spec, f"Missing required parameter: {param}"
+        
+        # Set default first payment offset (1 month is standard)
+        brick.spec.setdefault("first_payment_offset", 1)
 
     def simulate(self, brick: LBrick, ctx: ScenarioContext) -> BrickOutput:
         """
@@ -337,7 +388,7 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
         principal = float(brick.spec["principal"])
         rate_pa   = float(brick.spec["rate_pa"])
         n_total   = int(brick.spec["term_months"])
-        n = min(n_total, T)  # Don't exceed simulation period
+        # Use full term for payment calculation, but limit payments to simulation period
 
         # Initial loan drawdown at t=0
         cash_in[0] += principal
@@ -345,27 +396,53 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
 
         # Calculate monthly payment using annuity formula
         r_m = rate_pa / 12.0
-        if r_m > 0:
-            A = principal * (r_m * (1 + r_m) ** n) / ((1 + r_m) ** n - 1)
-        else:
-            A = principal / n  # Handle zero interest rate case
+        offset = int(brick.spec["first_payment_offset"])
         
-        # Calculate payment schedule
-        for t in range(n):
-            interest = debt[t] * r_m
-            principal_pay = min(A - interest, debt[t])  # Don't overpay
-            cash_out[t] += interest + principal_pay
-            
-            # Update debt balance for next period
-            if t + 1 < T:
-                debt[t+1] = max(debt[t] - principal_pay, 0.0)
+        # Use full term for payment calculation
+        if r_m > 0:
+            A = principal * (r_m * (1 + r_m) ** n_total) / ((1 + r_m) ** n_total - 1)
+        else:
+            A = principal / n_total  # Handle zero interest rate case
+        
+        # Carry forward debt unchanged until first payment
+        for t in range(1, min(offset, T)):
+            debt[t] = debt[t-1]
+        
+        # Calculate payment schedule starting from offset
+        n_sched = min(n_total, max(0, T - offset))
+        for k in range(n_sched):
+            t = offset + k
+            if t >= T:
+                break
+                
+            prev_debt = debt[t-1] if t > 0 else principal
+            if prev_debt > 0:
+                interest = prev_debt * r_m
+                principal_pay = min(A - interest, prev_debt)
+                cash_out[t] = interest + principal_pay
+                debt[t] = max(prev_debt - principal_pay, 0.0)
+            else:
+                debt[t] = 0.0
+
+        # Create time-stamped events
+        events = [
+            Event(ctx.t_index[0], "loan_draw", f"Mortgage drawdown: €{principal:,.2f}", 
+                  {"principal": principal})
+        ]
+        
+        # Add derived info if available
+        if "_derived" in brick.spec:
+            derived = brick.spec["_derived"]
+            events.append(Event(ctx.t_index[0], "loan_details", 
+                                f"Price: €{derived['price']:,.2f}, Down: €{derived['down_payment']:,.2f}, Fees financed: €{derived['fees_financed']:,.2f}",
+                                derived))
 
         return BrickOutput(
             cash_in=cash_in, 
             cash_out=cash_out,
             asset_value=np.zeros(T), 
             debt_balance=debt,
-            events=[f"t0: Mortgage drawdown - Principal: €{principal:,.2f}"]
+            events=events
         )
 
 # ---------- Cash Flow Strategies ----------
@@ -423,7 +500,8 @@ class FlowTransferLumpSum(IFlowStrategy):
             cash_out=np.zeros(T),
             asset_value=np.zeros(T), 
             debt_balance=np.zeros(T), 
-            events=[f"t0: Lump sum transfer - Amount: €{cash_in[0]:,.2f}"]
+            events=[Event(ctx.t_index[0], "transfer", f"Lump sum transfer: €{cash_in[0]:,.2f}", 
+                          {"amount": cash_in[0]})]
         )
 
 
@@ -478,7 +556,7 @@ class FlowIncomeFixed(IFlowStrategy):
             cash_out=np.zeros(T),
             asset_value=np.zeros(T), 
             debt_balance=np.zeros(T), 
-            events=[]
+            events=[]  # No events for regular income flows
         )
 
 
@@ -534,7 +612,7 @@ class FlowExpenseFixed(IFlowStrategy):
             cash_out=cash_out,
             asset_value=np.zeros(T), 
             debt_balance=np.zeros(T), 
-            events=[]
+            events=[]  # No events for regular expense flows
         )
 
 # ---------- Strategy Registry Setup ----------
@@ -567,17 +645,17 @@ def register_defaults():
         dictionaries directly.
     """
     # Register asset valuation strategies
-    ValuationRegistry["a.cash"]      = ValuationCash()
-    ValuationRegistry["a.property"]  = ValuationPropertyDiscrete()
-    ValuationRegistry["a.invest.etf"]= ValuationETFUnitized()
+    ValuationRegistry[K.A_CASH]      = ValuationCash()
+    ValuationRegistry[K.A_PROPERTY]  = ValuationPropertyDiscrete()
+    ValuationRegistry[K.A_INV_ETF]   = ValuationETFUnitized()
     
     # Register liability schedule strategies
-    ScheduleRegistry["l.mortgage.annuity"] = ScheduleMortgageAnnuity()
+    ScheduleRegistry[K.L_MORT_ANN]   = ScheduleMortgageAnnuity()
     
     # Register cash flow strategies
-    FlowRegistry["f.transfer.lumpsum"] = FlowTransferLumpSum()
-    FlowRegistry["f.income.salary"]    = FlowIncomeFixed()
-    FlowRegistry["f.expense.living"]   = FlowExpenseFixed()
+    FlowRegistry[K.F_TRANSFER]       = FlowTransferLumpSum()
+    FlowRegistry[K.F_INCOME]         = FlowIncomeFixed()
+    FlowRegistry[K.F_EXP_LIVING]     = FlowExpenseFixed()
 
 
 # Automatically register default strategies when module is imported
