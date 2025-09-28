@@ -653,9 +653,19 @@ class Scenario:
         cash_in_tot   = sum(o["cash_in"] for o in outputs.values())
         cash_out_tot  = sum(o["cash_out"] for o in outputs.values())
         assets_tot    = sum(o["asset_value"] for o in outputs.values())
-        debt_tot      = sum(o["debt_balance"] for o in outputs.values())
+        liabilities_tot = sum(o["debt_balance"] for o in outputs.values())
         net_cf        = cash_in_tot - cash_out_tot
-        equity        = assets_tot - debt_tot
+        equity        = assets_tot - liabilities_tot
+        
+        # Calculate non-cash assets (total assets minus cash)
+        from .kinds import K
+        cash_assets = None
+        for b in self.bricks:
+            if isinstance(b, ABrick) and b.kind == K.A_CASH:
+                s = outputs[b.id]["asset_value"]
+                cash_assets = s if cash_assets is None else (cash_assets + s)
+        cash_assets = cash_assets if cash_assets is not None else np.zeros(len(t_index))
+        non_cash_assets = assets_tot - cash_assets
 
         # Create summary DataFrame with monthly totals
         totals = pd.DataFrame({
@@ -664,22 +674,74 @@ class Scenario:
             "cash_out": cash_out_tot,
             "net_cf": net_cf, 
             "assets": assets_tot, 
-            "debt": debt_tot, 
+            "liabilities": liabilities_tot,  # Changed from "debt" to "liabilities"
+            "non_cash": non_cash_assets,     # New column for non-cash assets
             "equity": equity
         }).set_index("t")
         
         # Add cash column if requested
         if include_cash:
-            from .kinds import K
-            cash_series = None
-            for b in self.bricks:
-                if isinstance(b, ABrick) and b.kind == K.A_CASH:
-                    s = outputs[b.id]["asset_value"]
-                    cash_series = s if cash_series is None else (cash_series + s)
-            if cash_series is not None:
-                totals["cash"] = cash_series
+            totals["cash"] = cash_assets
         
         return {"outputs": outputs, "totals": totals, "_scenario_bricks": self.bricks}
+    
+    def aggregate_totals(self, totals: pd.DataFrame, frequency: str = "monthly") -> pd.DataFrame:
+        """
+        Aggregate scenario totals to different time frequencies.
+        
+        Args:
+            totals: The monthly totals DataFrame from scenario.run()
+            frequency: Aggregation frequency - "monthly", "quarterly", or "yearly"
+            
+        Returns:
+            Aggregated DataFrame with the specified frequency
+            
+        Example:
+            >>> results = scenario.run(start=date(2026, 1, 1), months=36)
+            >>> quarterly = scenario.aggregate_totals(results["totals"], "quarterly")
+            >>> yearly = scenario.aggregate_totals(results["totals"], "yearly")
+        """
+        if frequency == "monthly":
+            return totals
+        
+        # Convert index to proper datetime for resampling
+        df = totals.copy()
+        df.index = pd.to_datetime(df.index)
+        
+        if frequency == "quarterly":
+            # Aggregate to quarterly (Q-DEC)
+            agg_dict = {
+                "cash_in": "sum",      # Sum cash flows
+                "cash_out": "sum",     # Sum cash flows
+                "net_cf": "sum",       # Sum net cash flows
+                "assets": "last",      # Take last value (end of quarter)
+                "liabilities": "last", # Take last value (end of quarter)
+                "non_cash": "last",    # Take last value (end of quarter)
+                "equity": "last"       # Take last value (end of quarter)
+            }
+            if "cash" in df.columns:
+                agg_dict["cash"] = "last"  # Take last value (end of quarter)
+            
+            return df.resample("QE-DEC").agg(agg_dict)
+            
+        elif frequency == "yearly":
+            # Aggregate to yearly (A-DEC)
+            agg_dict = {
+                "cash_in": "sum",      # Sum cash flows
+                "cash_out": "sum",     # Sum cash flows
+                "net_cf": "sum",       # Sum net cash flows
+                "assets": "last",      # Take last value (end of year)
+                "liabilities": "last", # Take last value (end of year)
+                "non_cash": "last",    # Take last value (end of year)
+                "equity": "last"       # Take last value (end of year)
+            }
+            if "cash" in df.columns:
+                agg_dict["cash"] = "last"  # Take last value (end of year)
+            
+            return df.resample("YE-DEC").agg(agg_dict)
+        
+        else:
+            raise ValueError(f"Unsupported frequency: {frequency}. Use 'monthly', 'quarterly', or 'yearly'.")
     
     def _find_start_index(self, start_date: date, t_index: np.ndarray) -> Optional[int]:
         """
@@ -901,18 +963,18 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
     # 1) Identity checks
     fails = []
     
-    # Equity identity: equity = assets - debt
-    if not np.allclose(totals["equity"].values, (totals["assets"] - totals["debt"]).values, atol=tol):
-        fails.append("equity != assets - debt")
+    # Equity identity: equity = assets - liabilities
+    if not np.allclose(totals["equity"].values, (totals["assets"] - totals["liabilities"]).values, atol=tol):
+        fails.append("equity != assets - liabilities")
     
     # Cash flow consistency: net_cf = cash_in - cash_out
     if not np.allclose(totals["net_cf"].values, (totals["cash_in"] - totals["cash_out"]).values, atol=tol):
         fails.append("net_cf != cash_in - cash_out")
     
-    # Debt monotonicity: debt should not increase after initial draws
-    debt = totals["debt"].values
-    if len(debt) > 1 and not np.all(np.diff(debt[1:]) <= tol):
-        fails.append("debt increased after t0")
+    # Liabilities monotonicity: liabilities should not increase after initial draws
+    liabilities = totals["liabilities"].values
+    if len(liabilities) > 1 and not np.all(np.diff(liabilities[1:]) <= tol):
+        fails.append("liabilities increased after t0")
     
     # 4) Purchase settlement validation (if applicable)
     purchase_ok = True
@@ -1169,8 +1231,8 @@ def export_run_json(path: str, scenario: Scenario, res: dict, include_specs: boo
         
         # Parse validation results
         validation_results = {
-            "equity_identity": "equity != assets - debt" not in validation_output,
-            "debt_monotone": "debt increased after initial draws" not in validation_output,
+            "equity_identity": "equity != assets - liabilities" not in validation_output,
+            "liabilities_monotone": "liabilities increased after initial draws" not in validation_output,
             "cash_flow_consistent": "net_cf != cash_in - cash_out" not in validation_output,
             "purchase_settlement_ok": "purchase settlement mismatch" not in validation_output,
             "messages": [line.strip() for line in validation_output.split('\n') if line.strip() and "WARNING:" in line]
@@ -1179,7 +1241,7 @@ def export_run_json(path: str, scenario: Scenario, res: dict, include_specs: boo
         validation_results = {
             "error": str(e),
             "equity_identity": False,
-            "debt_monotone": False,
+            "liabilities_monotone": False,
             "cash_flow_consistent": False,
             "purchase_settlement_ok": False,
             "messages": [f"Validation error: {str(e)}"]
