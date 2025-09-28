@@ -949,6 +949,76 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
                            f"Suggest: top-up ≥ {minbuf-amt:,.2f} or lower min_buffer.")
                     fails.append(msg)
     
+    # 6) Balloon payment validation (only if we have bricks)
+    if bricks is not None:
+        from .kinds import K
+        for b in bricks:
+            if isinstance(b, LBrick) and b.kind == K.L_MORT_ANN:
+                # Check if this mortgage has a balloon policy
+                balloon_policy = (b.spec or {}).get("balloon_policy", "payoff")
+                if balloon_policy == "payoff":
+                    # Check if balloon was properly paid off
+                    debt_balance = outputs[b.id]["debt_balance"]
+                    cash_out = outputs[b.id]["cash_out"]
+                    
+                    # Find the last active month
+                    mask = active_mask(res["totals"].index.values, b.start_date, b.end_date, b.duration_m)
+                    if mask.any():
+                        t_stop = np.where(mask)[0][-1]
+                        residual_debt = debt_balance[t_stop]
+                        
+                        if residual_debt > tol:
+                            fails.append(f"Balloon inconsistency: mortgage '{b.id}' has residual debt €{residual_debt:,.2f} at end of window but balloon_policy='payoff'")
+                        
+                        # Check if balloon cash_out includes the residual debt payment
+                        # The balloon payment should be at least as large as the residual debt
+                        if t_stop > 0:
+                            debt_before_balloon = debt_balance[t_stop - 1]
+                            balloon_cash_out = cash_out[t_stop]
+                            # The balloon payment should be >= the debt before payment (includes regular payment + balloon)
+                            if balloon_cash_out > tol and balloon_cash_out < debt_before_balloon - tol:
+                                fails.append(f"Balloon payment insufficient: mortgage '{b.id}' balloon cash_out €{balloon_cash_out:,.2f} < debt before payment €{debt_before_balloon:,.2f}")
+    
+    # 7) ETF units validation (never negative)
+    for brick_id, output in outputs.items():
+        # Check if this is an ETF brick
+        brick = None
+        for b in res.get("_scenario_bricks", []):
+            if b.id == brick_id:
+                brick = b
+                break
+        
+        if brick and hasattr(brick, 'kind') and brick.kind == K.A_INV_ETF:
+            asset_value = output["asset_value"]
+            # We can't directly check units, but we can check for negative asset values
+            if (asset_value < -tol).any():
+                t_idx = int(np.where(asset_value < -tol)[0][0])
+                val = float(asset_value[t_idx])
+                fails.append(f"ETF units negative: '{brick_id}' has negative asset value €{val:,.2f} at month {t_idx}")
+    
+    # 8) Income escalator monotonicity (when annual_step_pct >= 0)
+    for brick_id, output in outputs.items():
+        # Check if this is an income brick
+        brick = None
+        for b in res.get("_scenario_bricks", []):
+            if b.id == brick_id:
+                brick = b
+                break
+        
+        if brick and hasattr(brick, 'kind') and brick.kind == K.F_INCOME:
+            annual_step_pct = float((brick.spec or {}).get("annual_step_pct", 0.0))
+            if annual_step_pct >= 0:
+                cash_in = output["cash_in"]
+                # Get activation mask to only check within active periods
+                mask = active_mask(res["totals"].index.values, brick.start_date, brick.end_date, brick.duration_m)
+                
+                # Check that income is non-decreasing within active periods
+                for t in range(1, len(cash_in)):
+                    # Only check if both current and previous months are active
+                    if mask[t] and mask[t-1] and cash_in[t] < cash_in[t-1] - tol:
+                        fails.append(f"Income escalator violation: '{brick_id}' income decreased from €{cash_in[t-1]:,.2f} to €{cash_in[t]:,.2f} at month {t}")
+                        break
+    
     # Handle failures
     if fails:
         full = "Run validation failed: " + " | ".join(fails)

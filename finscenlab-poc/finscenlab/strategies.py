@@ -219,13 +219,15 @@ class ValuationETFUnitized(IValuationStrategy):
     ETF investment valuation strategy (kind: 'a.invest.etf').
     
     This strategy models a unitized investment (like an ETF) with constant
-    price drift, optional dividend yield, and support for purchasing shares
-    through one-shot buys and dollar-cost averaging (DCA).
+    price drift, optional dividend yield, and support for purchasing and
+    selling shares through various mechanisms.
     
     Key Features:
         - Initial holdings (pre-owned units with no cash impact)
         - One-shot buy at start (buy_at_start by amount or units)
         - DCA plan by amount or units, with optional annual step-up
+        - One-shot sells by date (sell by amount or units)
+        - Systematic DCA-out (SDCA) for regular withdrawals
         - Dividend reinvestment or cash distribution
         - Configurable event logging
         
@@ -237,8 +239,17 @@ class ValuationETFUnitized(IValuationStrategy):
         - reinvest_dividends: Whether to reinvest dividends (default: False)
         - buy_at_start: One-shot purchase {"amount": X} or {"units": Y}
         - dca: DCA configuration with mode, amount/units, timing, and step-up
+        - sell: List of one-shot sells [{"t": "YYYY-MM", "amount": X} or {"units": Y}]
+        - sdca: Systematic DCA-out configuration for regular withdrawals
         - round_units_to: Round units to N decimal places (optional)
         - events_level: Event verbosity "none"|"major"|"all" (default: "major")
+        
+    Monthly Processing Order:
+        1. Dividends (reinvest or cash)
+        2. DCA buys (buy_at_start + monthly DCA)
+        3. One-shot sells
+        4. SDCA sells
+        5. Round units
     """
     
     def prepare(self, brick: ABrick, ctx: ScenarioContext) -> None:
@@ -259,6 +270,8 @@ class ValuationETFUnitized(IValuationStrategy):
         s.setdefault("reinvest_dividends", False)
         s.setdefault("buy_at_start", None)      # {"amount": >0} or {"units": >0}
         s.setdefault("dca", None)               # {"mode": "amount"|"units", ...}
+        s.setdefault("sell", [])                # [{"t": "YYYY-MM", "amount": X} or {"units": Y}]
+        s.setdefault("sdca", None)              # {"mode": "amount"|"units", ...}
         s.setdefault("round_units_to", None)
         s.setdefault("events_level", "major")   # "none"|"major"|"all"
 
@@ -288,6 +301,33 @@ class ValuationETFUnitized(IValuationStrategy):
                 assert bas["amount"] >= 0, "buy_at_start.amount must be >= 0"
             if "units" in bas:  
                 assert bas["units"] >= 0, "buy_at_start.units must be >= 0"
+
+        # Validate sell configuration
+        sell_directives = s["sell"]
+        for sell_spec in sell_directives:
+            assert "t" in sell_spec, "sell directive must include 't' (date)"
+            assert ("amount" in sell_spec) ^ ("units" in sell_spec), "sell directive: provide exactly one of {'amount','units'}"
+            if "amount" in sell_spec:
+                assert sell_spec["amount"] >= 0, "sell.amount must be >= 0"
+            if "units" in sell_spec:
+                assert sell_spec["units"] >= 0, "sell.units must be >= 0"
+
+        # Validate SDCA configuration
+        sdca = s["sdca"]
+        if sdca is not None:
+            mode = sdca.get("mode")
+            assert mode in ("amount", "units"), "sdca.mode must be 'amount' or 'units'"
+            if mode == "amount":
+                assert sdca.get("amount", 0) >= 0, "sdca.amount must be >= 0"
+            else:
+                assert sdca.get("units", 0) >= 0, "sdca.units must be >= 0"
+            
+            # Normalize offsets
+            off = int(sdca.get("start_offset_m", 0))
+            if off < 0:
+                sdca["start_offset_m"] = 0
+                print(f"[WARN] {brick.id}: sdca.start_offset_m < 0 -> clamped to 0")
+            sdca.setdefault("months", None)
 
     def simulate(self, brick: ABrick, ctx: ScenarioContext) -> BrickOutput:
         """
@@ -399,6 +439,48 @@ class ValuationETFUnitized(IValuationStrategy):
                                 events.append(Event(ctx.t_index[t], "dca_units",
                                                     f"DCA (units): {u:,.6f}u",
                                                     {"amount": amt, "units": u, "price": price[t]}))
+
+            # SELLS AFTER DCA (one-shot and SDCA)
+            # One-shot sells
+            sell_directives = s.get("sell", [])
+            for sell_spec in sell_directives:
+                sell_date = np.datetime64(sell_spec["t"], 'M')
+                if ctx.t_index[t] == sell_date:
+                    if "amount" in sell_spec:
+                        # Sell by cash target
+                        sell_units = min(units[t], sell_spec["amount"] / price[t])
+                    else:
+                        # Sell by units
+                        sell_units = min(units[t], sell_spec["units"])
+                    
+                    if sell_units > 0:
+                        units[t] -= sell_units
+                        cash_in[t] += sell_units * price[t]
+                        if ev_lvl in ("major", "all"):
+                            events.append(Event(ctx.t_index[t], "sell",
+                                                f"Sell {sell_units:,.6f}u for €{sell_units * price[t]:,.2f}",
+                                                {"units": sell_units, "amount": sell_units * price[t], "price": price[t]}))
+
+            # SDCA (Systematic DCA-out)
+            sdca = s.get("sdca")
+            if sdca is not None:
+                start_off = int(sdca.get("start_offset_m", 0))
+                months = sdca.get("months", None)
+                m_rel = t - start_off
+                if m_rel >= 0 and (months is None or m_rel < int(months)):
+                    if sdca["mode"] == "amount":
+                        amt = float(sdca["amount"])
+                        sell_units = min(units[t], amt / price[t])
+                    else:  # units mode
+                        sell_units = min(units[t], float(sdca["units"]))
+                    
+                    if sell_units > 0:
+                        units[t] -= sell_units
+                        cash_in[t] += sell_units * price[t]
+                        if ev_lvl == "all":
+                            events.append(Event(ctx.t_index[t], "sdca",
+                                                f"SDCA: {sell_units:,.6f}u for €{sell_units * price[t]:,.2f}",
+                                                {"units": sell_units, "amount": sell_units * price[t], "price": price[t]}))
 
             # Round units after all operations for the month
             if round_to is not None:
@@ -698,56 +780,129 @@ class FlowTransferLumpSum(IFlowStrategy):
 
 class FlowIncomeFixed(IFlowStrategy):
     """
-    Fixed monthly income flow strategy (kind: 'f.income.salary').
+    Fixed monthly income flow strategy with escalation (kind: 'f.income.salary').
     
-    This strategy models a regular monthly income stream with a constant amount.
+    This strategy models a regular monthly income stream with optional annual escalation.
     Commonly used for salary, pension, rental income, or other regular income sources.
     
     Required Parameters:
-        - amount_monthly: The monthly income amount
+        - amount_monthly: The base monthly income amount
+        
+    Optional Parameters:
+        - annual_step_pct: Annual escalation percentage (default: 0.0)
+        - step_month: Month when escalation occurs (default: None = anniversary of start_date)
+        - step_every_m: Alternative to annual escalation - step every N months (default: None)
         
     Note:
-        This strategy generates the same cash inflow every month throughout
-        the simulation period.
+        - If annual_step_pct > 0, income increases by that percentage each year
+        - step_month overrides calendar anniversary (e.g., step_month=6 for June every year)
+        - step_every_m provides non-annual escalation (e.g., step_every_m=18 for 18-month steps)
+        - annual_step_pct and step_every_m are mutually exclusive
     """
     
     def prepare(self, brick: FBrick, ctx: ScenarioContext) -> None:
         """
-        Prepare the fixed income strategy.
+        Prepare the income strategy with escalation.
         
-        Validates that the amount_monthly parameter is present.
+        Validates parameters and sets up escalation configuration.
         
         Args:
             brick: The income flow brick
             ctx: The simulation context
             
         Raises:
-            AssertionError: If amount_monthly parameter is missing
+            AssertionError: If required parameters are missing or configuration is invalid
         """
         assert "amount_monthly" in brick.spec, "Missing required parameter: amount_monthly"
+        
+        # Set defaults for escalation
+        brick.spec.setdefault("annual_step_pct", 0.0)
+        brick.spec.setdefault("step_month", None)
+        brick.spec.setdefault("step_every_m", None)
+        
+        # Validate escalation configuration
+        annual_step = brick.spec["annual_step_pct"]
+        step_every_m = brick.spec["step_every_m"]
+        
+        if annual_step != 0.0 and step_every_m is not None:
+            raise ValueError("Cannot specify both annual_step_pct and step_every_m")
+        
+        if step_every_m is not None:
+            if step_every_m < 1:
+                raise ValueError("step_every_m must be >= 1")
+            # For step_every_m, we need a step percentage
+            if "step_pct" not in brick.spec:
+                brick.spec["step_pct"] = annual_step  # Use annual_step_pct as default
 
     def simulate(self, brick: FBrick, ctx: ScenarioContext) -> BrickOutput:
         """
-        Simulate the fixed monthly income.
+        Simulate the income with optional escalation.
         
-        Generates a constant monthly cash inflow throughout the simulation period.
+        Generates monthly cash inflows with annual or periodic escalation.
         
         Args:
             brick: The income flow brick
             ctx: The simulation context
             
         Returns:
-            BrickOutput with constant monthly cash inflows and no events
+            BrickOutput with escalated monthly cash inflows and escalation events
         """
         T = len(ctx.t_index)
-        cash_in = np.full(T, float(brick.spec["amount_monthly"]))
+        cash_in = np.zeros(T)
+        
+        # Extract parameters
+        base_amount = float(brick.spec["amount_monthly"])
+        annual_step_pct = float(brick.spec["annual_step_pct"])
+        step_month = brick.spec.get("step_month")
+        step_every_m = brick.spec.get("step_every_m")
+        step_pct = float(brick.spec.get("step_pct", annual_step_pct))  # For step_every_m
+        
+        # Determine start date for anniversary calculations
+        start_date = brick.start_date or ctx.t_index[0].astype('datetime64[D]').astype(date)
+        
+        events = []
+        
+        # Calculate escalated amounts for each month
+        for t in range(T):
+            current_date = ctx.t_index[t].astype('datetime64[D]').astype(date)
+            
+            if step_every_m is not None:
+                # Non-annual escalation
+                months_since_start = t
+                steps = months_since_start // step_every_m
+                amount = base_amount * ((1 + step_pct) ** steps)
+            else:
+                # Annual escalation
+                years_since_start = (current_date.year - start_date.year)
+                
+                # Check if we've passed the step month in the current year
+                if step_month is not None:
+                    # Use specified month (e.g., June every year)
+                    if current_date.month >= step_month:
+                        years_since_start += 1
+                else:
+                    # Use anniversary of start date
+                    if (current_date.month > start_date.month or 
+                        (current_date.month == start_date.month and current_date.day >= start_date.day)):
+                        years_since_start += 1
+                
+                amount = base_amount * ((1 + annual_step_pct) ** years_since_start)
+            
+            cash_in[t] = amount
+            
+            # Add escalation event for the first month of each new amount
+            if t == 0 or cash_in[t] != cash_in[t-1]:
+                if annual_step_pct > 0 or step_every_m is not None:
+                    events.append(Event(ctx.t_index[t], "income_escalation",
+                                        f"Income escalated to €{amount:,.2f}/month",
+                                        {"amount": amount, "annual_step_pct": annual_step_pct}))
         
         return BrickOutput(
             cash_in=cash_in, 
             cash_out=np.zeros(T),
             asset_value=np.zeros(T), 
             debt_balance=np.zeros(T), 
-            events=[]  # No events for regular income flows
+            events=events
         )
 
 
