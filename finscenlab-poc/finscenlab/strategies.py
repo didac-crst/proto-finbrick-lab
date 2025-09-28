@@ -206,6 +206,26 @@ class ValuationPropertyDiscrete(IValuationStrategy):
             events.append(Event(ctx.t_index[0], "fees_financed", f"Fees financed: €{fees * fees_fin_pct:,.2f}",
                                 {"fees": fees, "fees_financed": fees * fees_fin_pct}))
 
+        # Auto-dispose on window end (equity-neutral)
+        from .core import active_mask
+        mask = active_mask(ctx.t_index, brick.start_date, brick.end_date, brick.duration_m)
+        dispose = bool(brick.spec.get("sell_on_window_end", True))  # DEFAULT: True
+        fees_pct = float(brick.spec.get("sell_fees_pct", 0.0))
+        
+        if dispose and mask.any():
+            t_stop = int(np.where(mask)[0].max())
+            gross = value[t_stop]
+            fees = gross * fees_pct
+            proceeds = gross - fees
+            
+            cash_in[t_stop] += proceeds      # book sale
+            value[t_stop] = 0.0              # explicit zero on the sale month
+            # Set all future values to 0 (property is sold)
+            value[t_stop+1:] = 0.0
+            events.append(Event(ctx.t_index[t_stop], "asset_dispose",
+                                f"Property sold for €{proceeds:,.2f}",
+                                {"gross": gross, "fees": fees, "fees_pct": fees_pct}))
+
         return BrickOutput(
             cash_in=cash_in, 
             cash_out=cash_out,
@@ -489,6 +509,26 @@ class ValuationETFUnitized(IValuationStrategy):
         # Calculate final asset values
         asset_value = units * price
 
+        # Auto-dispose on window end (equity-neutral)
+        from .core import active_mask
+        mask = active_mask(ctx.t_index, brick.start_date, brick.end_date, brick.duration_m)
+        dispose = bool(brick.spec.get("liquidate_on_window_end", True))  # DEFAULT: True
+        fees_pct = float(brick.spec.get("sell_fees_pct", 0.0))
+        
+        if dispose and mask.any():
+            t_stop = int(np.where(mask)[0].max())
+            gross = asset_value[t_stop]
+            fees = gross * fees_pct
+            proceeds = gross - fees
+            
+            cash_in[t_stop] += proceeds      # book sale
+            asset_value[t_stop] = 0.0        # explicit zero on the sale month
+            # Set all future values to 0 (ETF is liquidated)
+            asset_value[t_stop+1:] = 0.0
+            events.append(Event(ctx.t_index[t_stop], "asset_dispose",
+                                f"ETF liquidated for €{proceeds:,.2f}",
+                                {"gross": gross, "fees": fees, "fees_pct": fees_pct}))
+
         return BrickOutput(
             cash_in=cash_in,
             cash_out=cash_out,
@@ -660,22 +700,31 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
             else:
                 debt[t] = 0.0
 
-        # Handle balloon payment at end of activation window
-        mask = active_mask(ctx.t_index, brick.start_date, brick.end_date, brick.duration_m)
-        if mask.any():
-            t_stop = np.where(mask)[0][-1]  # Last active month
-            if debt[t_stop] > 0:
-                residual = debt[t_stop]
-                if balloon_policy == "payoff":
-                    cash_out[t_stop] += residual
-                    debt[t_stop] = 0.0
-                # Note: "refinance" policy leaves debt as-is (handled by event only)
-
         # Create time-stamped events
         events = [
             Event(ctx.t_index[0], "loan_draw", f"Mortgage drawdown: €{principal:,.2f}", 
                   {"principal": principal})
         ]
+        
+        # Balloon payoff on window end (equity-neutral)
+        mask = active_mask(ctx.t_index, brick.start_date, brick.end_date, brick.duration_m)
+        t_stop = int(np.where(mask)[0].max()) if mask.any() else None
+        
+        if t_stop is not None and debt[t_stop] > 0:
+            residual = debt[t_stop]
+            policy = brick.spec.get("balloon_policy", "payoff")  # DEFAULT
+            
+            if policy == "payoff":
+                cash_out[t_stop] += residual
+                debt[t_stop] = 0.0
+                # Set all future debt to 0 (mortgage is paid off)
+                debt[t_stop+1:] = 0.0
+                events.append(Event(ctx.t_index[t_stop], "balloon_payoff",
+                                    f"Balloon payoff €{residual:,.2f}", {"residual": residual}))
+            elif policy == "refinance":
+                events.append(Event(ctx.t_index[t_stop], "balloon_due",
+                                    f"Balloon due €{residual:,.2f}", {"residual": residual}))
+                # leave debt as computed; validator enforces presence of a new loan this month
         
         # Add derived info if available
         if "_derived" in brick.spec:
@@ -696,19 +745,6 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
                                     f"Prepayment: €{prepay_spec:,.2f}",
                                     {"type": "amount", "amount": prepay_spec}))
         
-        # Add balloon event
-        if mask.any():
-            t_stop = np.where(mask)[0][-1]
-            if debt[t_stop] > 0:
-                residual = debt[t_stop]
-                if balloon_policy == "payoff":
-                    events.append(Event(ctx.t_index[t_stop], "balloon_payoff", 
-                                        f"Balloon payoff: €{residual:,.2f}",
-                                        {"residual": residual}))
-                else:
-                    events.append(Event(ctx.t_index[t_stop], "balloon_due", 
-                                        f"Balloon due: €{residual:,.2f} (refinance required)",
-                                        {"residual": residual}))
 
         return BrickOutput(
             cash_in=cash_in, 

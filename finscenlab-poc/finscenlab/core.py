@@ -621,10 +621,9 @@ class Scenario:
             else:
                 outputs[b.id] = out
             
-            # Apply activation window mask
+            # Apply equity-neutral activation window mask
             mask = active_mask(t_index, b.start_date, b.end_date, b.duration_m)
-            for key in ["cash_in", "cash_out", "asset_value", "debt_balance"]:
-                outputs[b.id][key] = np.where(mask, outputs[b.id][key], 0.0)
+            _apply_window_equity_neutral(outputs[b.id], mask)
             
             # Add window end event if brick has an end
             if b.end_date is not None or b.duration_m is not None:
@@ -798,6 +797,30 @@ def active_mask(t_index: np.ndarray, start_date: Optional[date], end_date: Optio
         end = t_index[-1]
     
     return (t_index >= start) & (t_index <= end)
+
+def _apply_window_equity_neutral(out, mask):
+    """
+    Apply activation window mask in an equity-neutral way.
+    
+    Only flows (cash_in, cash_out) are masked to zero outside the window.
+    Stock series (asset_value, debt_balance) are NOT zeroed - they carry forward
+    the last active value unless explicitly set by terminal disposal/payoff events.
+    
+    Args:
+        out: BrickOutput dictionary with cash_in, cash_out, asset_value, debt_balance
+        mask: Boolean array indicating when the brick is active
+        
+    Note:
+        This preserves the accounting identity: equity only changes via explicit flows.
+        Terminal disposal/payoff events must book the appropriate cash legs at t_stop.
+    """
+    import numpy as np
+    
+    # Mask flows to zero outside the window
+    out["cash_in"]  = np.where(mask, out["cash_in"],  0.0)
+    out["cash_out"] = np.where(mask, out["cash_out"], 0.0)
+    
+    # Do NOT touch stocks here; terminal actions set them explicitly at t_stop
 
 def resolve_prepayments_to_month_idx(t_index: np.ndarray, prepayments: list, mortgage_start_date: date) -> dict:
     """
@@ -1018,6 +1041,34 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
                     if mask[t] and mask[t-1] and cash_in[t] < cash_in[t-1] - tol:
                         fails.append(f"Income escalator violation: '{brick_id}' income decreased from €{cash_in[t-1]:,.2f} to €{cash_in[t]:,.2f} at month {t}")
                         break
+    
+    # 9) Window-end equity identity validation
+    if bricks is not None:
+        from .kinds import K
+        for b in bricks:
+            if isinstance(b, (ABrick, LBrick)):
+                mask = active_mask(res["totals"].index.values, b.start_date, b.end_date, b.duration_m)
+                if not mask.any():
+                    continue
+                t_stop = int(np.where(mask)[0].max())
+                if t_stop + 1 >= len(res["totals"].index):
+                    continue
+                
+                ob = outputs[b.id]
+                # Check if there's a stock change at t_stop (auto-dispose/payoff)
+                # If stocks change at t_stop, the flows at t_stop should match the change
+                d_assets = ob["asset_value"][t_stop+1] - ob["asset_value"][t_stop]
+                d_debt = ob["debt_balance"][t_stop+1] - ob["debt_balance"][t_stop]
+                flows_t = ob["cash_in"][t_stop] - ob["cash_out"][t_stop]
+                
+                # Only validate if there's a significant stock change
+                if abs(d_assets - d_debt) > 0.01:
+                    if abs((d_assets - d_debt) - flows_t) > 0.01:
+                        raise ValueError(
+                            f"[{b.id}] Window-end equity mismatch at {res['totals'].index[t_stop]}: "
+                            f"Δstocks={d_assets - d_debt:.2f} vs flows={flows_t:.2f}. "
+                            "Missing sale/payoff or misordered terminal ops?"
+                        )
     
     # Handle failures
     if fails:
