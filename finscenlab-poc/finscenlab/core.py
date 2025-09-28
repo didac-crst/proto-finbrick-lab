@@ -29,6 +29,116 @@ import copy
 
 # ---------- time utilities ----------
 
+class ScenarioResults:
+    """
+    Helper class for convenient access to different time aggregations of scenario results.
+    
+    Provides ergonomic methods to access quarterly and yearly views of the monthly data.
+    """
+    def __init__(self, totals: pd.DataFrame):
+        """
+        Initialize with monthly totals DataFrame (PeriodIndex).
+        
+        Args:
+            totals: Monthly totals DataFrame with PeriodIndex
+        """
+        self.monthly = totals  # PeriodIndex 'M'
+    
+    def to_freq(self, freq: str = "Q") -> pd.DataFrame:
+        """
+        Aggregate to specified frequency.
+        
+        Args:
+            freq: Frequency string ('Q', 'Y', 'Q-DEC', etc.)
+            
+        Returns:
+            Aggregated DataFrame with PeriodIndex
+        """
+        return aggregate_totals(self.monthly, freq=freq, return_period_index=True)
+    
+    def quarterly(self) -> pd.DataFrame:
+        """Return quarterly aggregated data."""
+        return self.to_freq("Q")
+    
+    def yearly(self) -> pd.DataFrame:
+        """Return yearly aggregated data."""
+        return self.to_freq("Y")
+
+def aggregate_totals(df: pd.DataFrame, freq: str = "Q", 
+                     return_period_index: bool = True) -> pd.DataFrame:
+    """
+    Aggregate scenario totals by frequency with proper financial semantics.
+    
+    Stocks (assets, liabilities, equity, cash, non_cash) are aggregated using 'last' 
+    (period-end values). Flows (cash_in, cash_out, net_cf) are aggregated using 'sum' 
+    (total over the period).
+    
+    Args:
+        df: Monthly totals DataFrame
+        freq: Frequency string ('M', 'Q', 'Y', 'Q-DEC', 'Q-MAR', etc.)
+        return_period_index: If True, return PeriodIndex; if False, return Timestamp index
+        
+    Returns:
+        Aggregated DataFrame
+        
+    Example:
+        >>> monthly = scenario.run(start=date(2026, 1, 1), months=36)["totals"]
+        >>> quarterly = aggregate_totals(monthly, "Q")
+        >>> yearly = aggregate_totals(monthly, "Y")
+    """
+    if not isinstance(df.index, pd.PeriodIndex):
+        df = df.copy()
+        df.index = df.index.to_period("M")
+
+    # Define aggregation rules based on financial semantics
+    flows = ["cash_in", "cash_out", "net_cf"]
+    stocks = ["assets", "liabilities", "equity", "cash", "non_cash"]
+    
+    # Only aggregate columns that exist
+    flows = [c for c in flows if c in df.columns]
+    stocks = [c for c in stocks if c in df.columns]
+
+    agg = {**{c: "sum" for c in flows}, **{c: "last" for c in stocks}}
+    out = df.groupby(df.index.asfreq(freq)).agg(agg)
+
+    if return_period_index:
+        return out
+    return out.to_timestamp(how="end")  # Convert to period-end timestamps
+
+def finalize_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Finalize totals DataFrame with proper column names, non_cash calculation, and identity assertions.
+    
+    Args:
+        df: Raw totals DataFrame
+        
+    Returns:
+        Finalized DataFrame with proper financial identities
+        
+    Raises:
+        AssertionError: If financial identities are violated
+    """
+    df = df.copy()
+    
+    # Rename debt to liabilities if present
+    if "debt" in df.columns:
+        df = df.rename(columns={"debt": "liabilities"})
+    
+    # Calculate non_cash assets
+    df["non_cash"] = df["assets"] - df["cash"]
+    
+    # Assert financial identities with small tolerance for floating point errors
+    eps = 1e-6
+    if "equity" in df.columns and "assets" in df.columns and "liabilities" in df.columns:
+        equity_identity = (df["equity"] - (df["assets"] - df["liabilities"])).abs().max()
+        assert equity_identity < eps, f"Equity identity violated: max error = {equity_identity}"
+    
+    if "assets" in df.columns and "cash" in df.columns and "non_cash" in df.columns:
+        assets_identity = (df["assets"] - (df["cash"] + df["non_cash"])).abs().max()
+        assert assets_identity < eps, f"Assets identity violated: max error = {assets_identity}"
+    
+    return df
+
 def month_range(start: date, months: int) -> np.ndarray:
     """
     Generate a range of monthly dates starting from a given date.
@@ -544,6 +654,7 @@ class Scenario:
     name: str
     bricks: List[FinBrickABC]
     currency: str = "EUR"
+    _last_totals: Optional[pd.DataFrame] = None
 
     def run(self, start: date, months: int, include_cash: bool = True) -> dict:
         """
@@ -683,65 +794,40 @@ class Scenario:
         if include_cash:
             totals["cash"] = cash_assets
         
-        return {"outputs": outputs, "totals": totals, "_scenario_bricks": self.bricks}
+        # Ensure monthly PeriodIndex (period-end)
+        if not isinstance(totals.index, pd.PeriodIndex):
+            totals.index = totals.index.to_period("M")
+        
+        # Finalize totals with proper identities and assertions
+        totals = finalize_totals(totals)
+        
+        # Store for convenience methods
+        self._last_totals = totals
+        
+        return {"outputs": outputs, "totals": totals, "views": ScenarioResults(totals), "_scenario_bricks": self.bricks}
     
-    def aggregate_totals(self, totals: pd.DataFrame, frequency: str = "monthly") -> pd.DataFrame:
+    def aggregate_totals(self, freq: str = "Q", **kwargs) -> pd.DataFrame:
         """
-        Aggregate scenario totals to different time frequencies.
+        Convenience method to aggregate the last run's totals to different frequencies.
         
         Args:
-            totals: The monthly totals DataFrame from scenario.run()
-            frequency: Aggregation frequency - "monthly", "quarterly", or "yearly"
+            freq: Frequency string ('Q', 'Y', 'Q-DEC', 'Q-MAR', etc.)
+            **kwargs: Additional arguments passed to aggregate_totals()
             
         Returns:
             Aggregated DataFrame with the specified frequency
             
+        Raises:
+            RuntimeError: If no scenario has been run yet
+            
         Example:
-            >>> results = scenario.run(start=date(2026, 1, 1), months=36)
-            >>> quarterly = scenario.aggregate_totals(results["totals"], "quarterly")
-            >>> yearly = scenario.aggregate_totals(results["totals"], "yearly")
+            >>> scenario.run(start=date(2026, 1, 1), months=36)
+            >>> quarterly = scenario.aggregate_totals("Q")
+            >>> yearly = scenario.aggregate_totals("Y")
         """
-        if frequency == "monthly":
-            return totals
-        
-        # Convert index to proper datetime for resampling
-        df = totals.copy()
-        df.index = pd.to_datetime(df.index)
-        
-        if frequency == "quarterly":
-            # Aggregate to quarterly (Q-DEC)
-            agg_dict = {
-                "cash_in": "sum",      # Sum cash flows
-                "cash_out": "sum",     # Sum cash flows
-                "net_cf": "sum",       # Sum net cash flows
-                "assets": "last",      # Take last value (end of quarter)
-                "liabilities": "last", # Take last value (end of quarter)
-                "non_cash": "last",    # Take last value (end of quarter)
-                "equity": "last"       # Take last value (end of quarter)
-            }
-            if "cash" in df.columns:
-                agg_dict["cash"] = "last"  # Take last value (end of quarter)
-            
-            return df.resample("QE-DEC").agg(agg_dict)
-            
-        elif frequency == "yearly":
-            # Aggregate to yearly (A-DEC)
-            agg_dict = {
-                "cash_in": "sum",      # Sum cash flows
-                "cash_out": "sum",     # Sum cash flows
-                "net_cf": "sum",       # Sum net cash flows
-                "assets": "last",      # Take last value (end of year)
-                "liabilities": "last", # Take last value (end of year)
-                "non_cash": "last",    # Take last value (end of year)
-                "equity": "last"       # Take last value (end of year)
-            }
-            if "cash" in df.columns:
-                agg_dict["cash"] = "last"  # Take last value (end of year)
-            
-            return df.resample("YE-DEC").agg(agg_dict)
-        
-        else:
-            raise ValueError(f"Unsupported frequency: {frequency}. Use 'monthly', 'quarterly', or 'yearly'.")
+        if self._last_totals is None:
+            raise RuntimeError("No scenario has been run yet. Call scenario.run() first.")
+        return aggregate_totals(self._last_totals, freq=freq, **kwargs)
     
     def _find_start_index(self, start_date: date, t_index: np.ndarray) -> Optional[int]:
         """
@@ -821,12 +907,12 @@ class Scenario:
 
 # ---------- activation window utilities ----------
 
-def active_mask(t_index: np.ndarray, start_date: Optional[date], end_date: Optional[date], duration_m: Optional[int]) -> np.ndarray:
+def active_mask(t_index, start_date: Optional[date], end_date: Optional[date], duration_m: Optional[int]) -> np.ndarray:
     """
     Create a boolean mask indicating when a brick is active.
     
     Args:
-        t_index: Time index array (np.datetime64[M])
+        t_index: Time index array (np.datetime64[M] or pd.PeriodIndex)
         start_date: When the brick becomes active (None = scenario start)
         end_date: When the brick becomes inactive (None = scenario end)
         duration_m: Duration in months (alternative to end_date)
@@ -838,12 +924,19 @@ def active_mask(t_index: np.ndarray, start_date: Optional[date], end_date: Optio
         - duration_m includes the start month (duration_m=12 means 12 months including start_date)
         - end_date takes precedence over duration_m if both are provided
         - Inactive periods are masked with False (will be zeroed in outputs)
+        - Handles both DatetimeIndex and PeriodIndex
     """
+    # Handle PeriodIndex by converting to datetime64 for comparison
+    if isinstance(t_index, pd.PeriodIndex):
+        t_index_dt = t_index.to_timestamp()
+    else:
+        t_index_dt = t_index
+    
     # Normalize start date
     if start_date is not None:
         start = np.datetime64(start_date, 'M')
     else:
-        start = t_index[0]
+        start = t_index_dt[0]
     
     # Determine end date
     if end_date is not None:
@@ -856,9 +949,9 @@ def active_mask(t_index: np.ndarray, start_date: Optional[date], end_date: Optio
             raise ValueError("duration_m must be >= 1")
         end = start + np.timedelta64(duration_m - 1, 'M')  # inclusive
     else:
-        end = t_index[-1]
+        end = t_index_dt[-1]
     
-    return (t_index >= start) & (t_index <= end)
+    return (t_index_dt >= start) & (t_index_dt <= end)
 
 def _apply_window_equity_neutral(out, mask):
     """
@@ -1047,7 +1140,7 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
                     cash_out = outputs[b.id]["cash_out"]
                     
                     # Find the last active month
-                    mask = active_mask(res["totals"].index.values, b.start_date, b.end_date, b.duration_m)
+                    mask = active_mask(res["totals"].index, b.start_date, b.end_date, b.duration_m)
                     if mask.any():
                         t_stop = np.where(mask)[0][-1]
                         residual_debt = debt_balance[t_stop]
@@ -1095,7 +1188,7 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
             if annual_step_pct >= 0:
                 cash_in = output["cash_in"]
                 # Get activation mask to only check within active periods
-                mask = active_mask(res["totals"].index.values, brick.start_date, brick.end_date, brick.duration_m)
+                mask = active_mask(res["totals"].index, brick.start_date, brick.end_date, brick.duration_m)
                 
                 # Check that income is non-decreasing within active periods
                 for t in range(1, len(cash_in)):
@@ -1109,7 +1202,7 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
         from .kinds import K
         for b in bricks:
             if isinstance(b, (ABrick, LBrick)):
-                mask = active_mask(res["totals"].index.values, b.start_date, b.end_date, b.duration_m)
+                mask = active_mask(res["totals"].index, b.start_date, b.end_date, b.duration_m)
                 if not mask.any():
                     continue
                 t_stop = int(np.where(mask)[0].max())
