@@ -287,6 +287,8 @@ class FinBrickABC:
     links: dict = None    # References to other bricks
     family: str = None    # 'a' | 'l' | 'f' - set automatically in subclasses
     start_date: Optional[date] = None  # When this brick becomes active
+    end_date: Optional[date] = None    # When this brick becomes inactive
+    duration_m: Optional[int] = None   # Duration in months (alternative to end_date)
 
     def prepare(self, ctx: ScenarioContext) -> None:
         """
@@ -616,12 +618,27 @@ class Scenario:
             if start_idx > 0:
                 shifted_out = self._shift_output(out, start_idx, len(t_index))
                 outputs[b.id] = shifted_out
-                routed_in  += shifted_out["cash_in"]
-                routed_out += shifted_out["cash_out"]
             else:
                 outputs[b.id] = out
-                routed_in  += out["cash_in"]
-                routed_out += out["cash_out"]
+            
+            # Apply activation window mask
+            mask = active_mask(t_index, b.start_date, b.end_date, b.duration_m)
+            for key in ["cash_in", "cash_out", "asset_value", "debt_balance"]:
+                outputs[b.id][key] = np.where(mask, outputs[b.id][key], 0.0)
+            
+            # Add window end event if brick has an end
+            if b.end_date is not None or b.duration_m is not None:
+                end_idx = np.where(mask)[0]
+                if len(end_idx) > 0:
+                    last_active_idx = end_idx[-1]
+                    outputs[b.id]["events"].append(
+                        Event(t_index[last_active_idx], "window_end", 
+                              f"Brick '{b.name}' window ended", {"brick_id": b.id})
+                    )
+            
+            # Accumulate cash flows for routing
+            routed_in  += outputs[b.id]["cash_in"]
+            routed_out += outputs[b.id]["cash_out"]
 
         # Route accumulated cash flows to the cash account
         cash_brick = ctx.registry[cash_id]
@@ -740,6 +757,95 @@ class Scenario:
             debt_balance=full_debt_balance,
             events=output["events"]  # Events don't need shifting
         )
+
+# ---------- activation window utilities ----------
+
+def active_mask(t_index: np.ndarray, start_date: Optional[date], end_date: Optional[date], duration_m: Optional[int]) -> np.ndarray:
+    """
+    Create a boolean mask indicating when a brick is active.
+    
+    Args:
+        t_index: Time index array (np.datetime64[M])
+        start_date: When the brick becomes active (None = scenario start)
+        end_date: When the brick becomes inactive (None = scenario end)
+        duration_m: Duration in months (alternative to end_date)
+        
+    Returns:
+        Boolean array where True indicates the brick is active
+        
+    Note:
+        - duration_m includes the start month (duration_m=12 means 12 months including start_date)
+        - end_date takes precedence over duration_m if both are provided
+        - Inactive periods are masked with False (will be zeroed in outputs)
+    """
+    # Normalize start date
+    if start_date is not None:
+        start = np.datetime64(start_date, 'M')
+    else:
+        start = t_index[0]
+    
+    # Determine end date
+    if end_date is not None:
+        end = np.datetime64(end_date, 'M')
+        # Warn if both end_date and duration_m are provided
+        if duration_m is not None:
+            print(f"[WARN] Both end_date and duration_m provided; using end_date {end_date}")
+    elif duration_m is not None:
+        if duration_m < 1:
+            raise ValueError("duration_m must be >= 1")
+        end = start + np.timedelta64(duration_m - 1, 'M')  # inclusive
+    else:
+        end = t_index[-1]
+    
+    return (t_index >= start) & (t_index <= end)
+
+def resolve_prepayments_to_month_idx(t_index: np.ndarray, prepayments: list, mortgage_start_date: date) -> dict:
+    """
+    Resolve prepayment directives to month indices.
+    
+    Args:
+        t_index: Time index array (np.datetime64[M])
+        prepayments: List of prepayment directives
+        mortgage_start_date: Start date of the mortgage for relative calculations
+        
+    Returns:
+        Dictionary mapping month index to prepayment amount
+        
+    Note:
+        Supports both absolute dates ("t": "YYYY-MM") and periodic schedules
+        ({"every": "year", "month": 12, "amount": 5000})
+    """
+    prepay_map = {}
+    
+    for prepay in prepayments:
+        if "t" in prepay:
+            # Absolute date specification
+            prepay_date = np.datetime64(prepay["t"], 'M')
+            month_idx = np.where(t_index == prepay_date)[0]
+            if len(month_idx) > 0:
+                idx = month_idx[0]
+                if "amount" in prepay:
+                    prepay_map[idx] = float(prepay["amount"])
+                elif "pct_balance" in prepay:
+                    prepay_map[idx] = ("pct", float(prepay["pct_balance"]), float(prepay.get("cap", float('inf'))))
+        elif "every" in prepay:
+            # Periodic specification
+            if prepay["every"] == "year":
+                start_year = prepay.get("start_year", mortgage_start_date.year)
+                end_year = prepay.get("end_year", start_year + 10)
+                month = prepay["month"]
+                
+                for year in range(start_year, end_year + 1):
+                    prepay_date = np.datetime64(f"{year}-{month:02d}", 'M')
+                    month_idx = np.where(t_index == prepay_date)[0]
+                    if len(month_idx) > 0:
+                        idx = month_idx[0]
+                        if "amount" in prepay:
+                            prepay_map[idx] = float(prepay["amount"])
+                        elif "pct_balance" in prepay:
+                            prepay_map[idx] = ("pct", float(prepay["pct_balance"]), float(prepay.get("cap", float('inf'))))
+    
+    return prepay_map
 
 # ---------- validation utilities ----------
 

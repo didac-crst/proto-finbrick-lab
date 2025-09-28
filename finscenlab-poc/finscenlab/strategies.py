@@ -494,16 +494,18 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
         Simulate the mortgage over the time period.
         
         Calculates the annuity payment schedule with equal monthly payments
-        that include both principal and interest. The debt balance decreases
-        over time as principal is paid down.
+        that include both principal and interest. Supports prepayments (Sondertilgung)
+        and balloon payments at the end of the activation window.
         
         Args:
             brick: The mortgage brick
             ctx: The simulation context
             
         Returns:
-            BrickOutput with loan drawdown, payment schedule, debt balance, and drawdown event
+            BrickOutput with loan drawdown, payment schedule, debt balance, and events
         """
+        from .core import resolve_prepayments_to_month_idx, active_mask
+        
         T = len(ctx.t_index)
         cash_in  = np.zeros(T)
         cash_out = np.zeros(T)
@@ -513,7 +515,16 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
         principal = float(brick.spec["principal"])
         rate_pa   = float(brick.spec["rate_pa"])
         n_total   = int(brick.spec["term_months"])
-        # Use full term for payment calculation, but limit payments to simulation period
+        offset = int(brick.spec["first_payment_offset"])
+        
+        # Prepayment configuration
+        prepayments = brick.spec.get("prepayments", [])
+        prepay_fee_pct = float(brick.spec.get("prepay_fee_pct", 0.0))
+        balloon_policy = brick.spec.get("balloon_policy", "payoff")
+        
+        # Resolve prepayments to month indices
+        mortgage_start = brick.start_date or ctx.t_index[0].astype('datetime64[D]').astype(date)
+        prepay_map = resolve_prepayments_to_month_idx(ctx.t_index, prepayments, mortgage_start)
 
         # Initial loan drawdown at t=0
         cash_in[0] += principal
@@ -521,9 +532,6 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
 
         # Calculate monthly payment using annuity formula
         r_m = rate_pa / 12.0
-        offset = int(brick.spec["first_payment_offset"])
-        
-        # Use full term for payment calculation
         if r_m > 0:
             A = principal * (r_m * (1 + r_m) ** n_total) / ((1 + r_m) ** n_total - 1)
         else:
@@ -533,7 +541,7 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
         for t in range(1, min(offset, T)):
             debt[t] = debt[t-1]
         
-        # Calculate payment schedule starting from offset
+        # Calculate payment schedule with prepayments
         n_sched = min(n_total, max(0, T - offset))
         for k in range(n_sched):
             t = offset + k
@@ -542,12 +550,44 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
                 
             prev_debt = debt[t-1] if t > 0 else principal
             if prev_debt > 0:
+                # 1. Accrue interest
                 interest = prev_debt * r_m
+                
+                # 2. Scheduled annuity payment
                 principal_pay = min(A - interest, prev_debt)
-                cash_out[t] = interest + principal_pay
-                debt[t] = max(prev_debt - principal_pay, 0.0)
+                bal_after_sched = max(prev_debt - principal_pay, 0.0)
+                
+                # 3. Prepayment (Sondertilgung)
+                prepay_amt = 0.0
+                if t in prepay_map:
+                    prepay_spec = prepay_map[t]
+                    if isinstance(prepay_spec, tuple):  # Percentage-based
+                        pct, cap = prepay_spec[1], prepay_spec[2]
+                        prepay_amt = min(pct * bal_after_sched, cap, bal_after_sched)
+                    else:  # Fixed amount
+                        prepay_amt = min(prepay_spec, bal_after_sched)
+                
+                # Apply prepayment
+                if prepay_amt > 0:
+                    prepay_fee = prepay_amt * prepay_fee_pct
+                    cash_out[t] += interest + principal_pay + prepay_amt + prepay_fee
+                    debt[t] = max(bal_after_sched - prepay_amt, 0.0)
+                else:
+                    cash_out[t] += interest + principal_pay
+                    debt[t] = bal_after_sched
             else:
                 debt[t] = 0.0
+
+        # Handle balloon payment at end of activation window
+        mask = active_mask(ctx.t_index, brick.start_date, brick.end_date, brick.duration_m)
+        if mask.any():
+            t_stop = np.where(mask)[0][-1]  # Last active month
+            if debt[t_stop] > 0:
+                residual = debt[t_stop]
+                if balloon_policy == "payoff":
+                    cash_out[t_stop] += residual
+                    debt[t_stop] = 0.0
+                # Note: "refinance" policy leaves debt as-is (handled by event only)
 
         # Create time-stamped events
         events = [
@@ -561,6 +601,32 @@ class ScheduleMortgageAnnuity(IScheduleStrategy):
             events.append(Event(ctx.t_index[0], "loan_details", 
                                 f"Price: €{derived['price']:,.2f}, Down: €{derived['down_payment']:,.2f}, Fees financed: €{derived['fees_financed']:,.2f}",
                                 derived))
+        
+        # Add prepayment events
+        for t, prepay_spec in prepay_map.items():
+            if isinstance(prepay_spec, tuple):
+                pct, cap = prepay_spec[1], prepay_spec[2]
+                events.append(Event(ctx.t_index[t], "prepay", 
+                                    f"Prepayment {pct*100:.1f}% of balance (capped at €{cap:,.2f})",
+                                    {"type": "percentage", "pct": pct, "cap": cap}))
+            else:
+                events.append(Event(ctx.t_index[t], "prepay", 
+                                    f"Prepayment: €{prepay_spec:,.2f}",
+                                    {"type": "amount", "amount": prepay_spec}))
+        
+        # Add balloon event
+        if mask.any():
+            t_stop = np.where(mask)[0][-1]
+            if debt[t_stop] > 0:
+                residual = debt[t_stop]
+                if balloon_policy == "payoff":
+                    events.append(Event(ctx.t_index[t_stop], "balloon_payoff", 
+                                        f"Balloon payoff: €{residual:,.2f}",
+                                        {"residual": residual}))
+                else:
+                    events.append(Event(ctx.t_index[t_stop], "balloon_due", 
+                                        f"Balloon due: €{residual:,.2f} (refinance required)",
+                                        {"residual": residual}))
 
         return BrickOutput(
             cash_in=cash_in, 
