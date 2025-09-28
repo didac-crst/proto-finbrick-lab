@@ -663,6 +663,7 @@ class Scenario:
     bricks: List[FinBrickABC]
     currency: str = "EUR"
     _last_totals: Optional[pd.DataFrame] = None
+    _last_results: Optional[dict] = None
 
     def run(self, start: date, months: int, include_cash: bool = True) -> dict:
         """
@@ -811,8 +812,9 @@ class Scenario:
         
         # Store for convenience methods
         self._last_totals = totals
+        self._last_results = {"outputs": outputs, "totals": totals, "views": ScenarioResults(totals), "_scenario_bricks": self.bricks}
         
-        return {"outputs": outputs, "totals": totals, "views": ScenarioResults(totals), "_scenario_bricks": self.bricks}
+        return self._last_results
     
     def aggregate_totals(self, freq: str = "Q", **kwargs) -> pd.DataFrame:
         """
@@ -836,6 +838,32 @@ class Scenario:
         if self._last_totals is None:
             raise RuntimeError("No scenario has been run yet. Call scenario.run() first.")
         return aggregate_totals(self._last_totals, freq=freq, **kwargs)
+    
+    def validate(self, mode: str = "raise", tol: float = 1e-6) -> None:
+        """
+        Validate the last run's results using the scenario's bricks.
+        
+        This is a convenience method that automatically uses the last run's results
+        and the scenario's bricks, so you don't need to pass them manually.
+        
+        Args:
+            mode: Validation mode - "raise" (default) or "warn"
+            tol: Tolerance for floating point comparisons
+            
+        Raises:
+            RuntimeError: If no scenario has been run yet
+            AssertionError: If validation fails and mode="raise"
+            
+        Example:
+            >>> scenario.run(start=date(2026, 1, 1), months=36)
+            >>> scenario.validate()  # Raises on validation failure
+            >>> scenario.validate(mode="warn")  # Warns on validation failure
+        """
+        if self._last_results is None:
+            raise RuntimeError("No scenario has been run yet. Call scenario.run() first.")
+        
+        # Use the stored results from the last run
+        validate_run(self._last_results, self.bricks, mode=mode, tol=tol)
     
     def _find_start_index(self, start_date: date, t_index: np.ndarray) -> Optional[int]:
         """
