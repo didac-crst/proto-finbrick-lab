@@ -42,7 +42,7 @@ class ScenarioResults:
         Args:
             totals: Monthly totals DataFrame with PeriodIndex
         """
-        self.monthly = totals  # PeriodIndex 'M'
+        self._monthly_data = totals  # PeriodIndex 'M'
     
     def to_freq(self, freq: str = "Q") -> pd.DataFrame:
         """
@@ -54,7 +54,11 @@ class ScenarioResults:
         Returns:
             Aggregated DataFrame with PeriodIndex
         """
-        return aggregate_totals(self.monthly, freq=freq, return_period_index=True)
+        return aggregate_totals(self._monthly_data, freq=freq, return_period_index=True)
+    
+    def monthly(self) -> pd.DataFrame:
+        """Return monthly data (no aggregation needed)."""
+        return self._monthly_data
     
     def quarterly(self) -> pd.DataFrame:
         """Return quarterly aggregated data."""
@@ -89,6 +93,10 @@ def aggregate_totals(df: pd.DataFrame, freq: str = "Q",
     if not isinstance(df.index, pd.PeriodIndex):
         df = df.copy()
         df.index = df.index.to_period("M")
+
+    # Handle monthly frequency (no aggregation needed)
+    if freq.upper() in ["M", "MONTHLY"]:
+        return df
 
     # Define aggregation rules based on financial semantics
     flows = ["cash_in", "cash_out", "net_cf"]
