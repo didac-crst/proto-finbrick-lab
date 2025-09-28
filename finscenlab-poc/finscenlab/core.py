@@ -26,6 +26,79 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import copy
+import math
+import warnings
+
+# Import kinds for type checking
+from .kinds import K
+
+# ---------- mortgage refactoring dataclasses ----------
+
+@dataclass
+class StartLink:
+    """Link to define when a brick starts based on another brick's lifecycle."""
+    on_end_of: Optional[str] = None          # brick_id - start when brick ends
+    on_fix_end_of: Optional[str] = None      # brick_id - start when brick's fixed rate period ends
+    offset_m: int = 0                        # months offset from the reference point
+
+@dataclass
+class PrincipalLink:
+    """Link to define how a mortgage gets its principal amount."""
+    from_house: Optional[str] = None         # brick_id of A_PROPERTY - price - down_payment - fees
+    remaining_of: Optional[str] = None       # brick_id of L_MORT_ANN - take remaining balance
+    share: Optional[float] = None            # 0..1, for remaining_of - take this fraction
+    nominal: Optional[float] = None          # explicit amount or None
+    fill_remaining: bool = False             # absorbs residual of the settlement bucket
+
+@dataclass
+class LMortgageSpec:
+    """Enhanced mortgage specification with rate fix windows and amortization options."""
+    rate_pa: float                           # annual interest rate
+    term_months: Optional[int] = None        # months to amortize to zero (loan term)
+    amortization_pa: Optional[float] = None  # initial annual amortization rate
+    fix_rate_months: Optional[int] = None    # months the current rate applies (fixed-rate window)
+    finance_fees: bool = False               # if fees are rolled into principal
+
+# ---------- exceptions ----------
+
+class ConfigError(Exception):
+    """Configuration error during scenario setup or validation."""
+    pass
+
+# ---------- mortgage calculation utilities ----------
+
+def term_from_amort(rate_pa: float, amort_pa: float) -> int:
+    """
+    Calculate loan term in months from annual interest rate and amortization rate.
+    
+    Uses the exact closed-form formula for annuity loans where:
+    M = P * (rate_pa + amort_pa) / 12
+    
+    Args:
+        rate_pa: Annual interest rate (e.g., 0.034 for 3.4%)
+        amort_pa: Annual amortization rate (e.g., 0.02 for 2%)
+        
+    Returns:
+        Number of months to fully amortize the loan
+        
+    Raises:
+        ValueError: If parameters are invalid
+    """
+    if amort_pa <= 0:
+        raise ValueError("amortization_pa must be > 0")
+    if rate_pa + amort_pa >= 1:
+        raise ValueError("rate_pa + amort_pa must be < 1")
+    
+    if rate_pa == 0.0:
+        # Linear amortization: M = P / n, so n = 12 / amort_pa
+        return math.ceil(12 / amort_pa)
+    
+    # Annuity formula: solve for n where balance → 0
+    r = rate_pa / 12.0
+    num = math.log(amort_pa / (rate_pa + amort_pa))
+    den = math.log(1 + r)
+    n = -num / den
+    return int(math.ceil(n))
 
 # ---------- time utilities ----------
 
@@ -662,6 +735,7 @@ class Scenario:
     name: str
     bricks: List[FinBrickABC]
     currency: str = "EUR"
+    settlement_default_cash_id: Optional[str] = None  # Default cash account for settlement shortfalls
     _last_totals: Optional[pd.DataFrame] = None
     _last_results: Optional[dict] = None
 
@@ -698,6 +772,9 @@ class Scenario:
         ctx = ScenarioContext(t_index=t_index, currency=self.currency,
                               registry={b.id: b for b in self.bricks})
 
+        # Resolve mortgage links and validate settlement buckets
+        self._resolve_mortgage_links()
+        
         # Wire strategies to bricks based on their kind discriminators
         wire_strategies(self.bricks)
 
@@ -778,7 +855,6 @@ class Scenario:
         equity        = assets_tot - liabilities_tot
         
         # Calculate non-cash assets (total assets minus cash)
-        from .kinds import K
         cash_assets = None
         for b in self.bricks:
             if isinstance(b, ABrick) and b.kind == K.A_CASH:
@@ -864,6 +940,224 @@ class Scenario:
         
         # Use the stored results from the last run
         validate_run(self._last_results, self.bricks, mode=mode, tol=tol)
+    
+    def _resolve_mortgage_links(self) -> None:
+        """
+        Resolve mortgage links and validate settlement buckets.
+        
+        This method processes all mortgage bricks to:
+        1. Resolve start dates from StartLink references
+        2. Resolve principal amounts from PrincipalLink references
+        3. Validate settlement buckets for remaining_of links
+        4. Handle deprecation warnings for legacy formats
+        """
+        # Create brick registry for lookups
+        brick_registry = {b.id: b for b in self.bricks}
+        
+        # Process each mortgage brick
+        for brick in self.bricks:
+            if not isinstance(brick, LBrick) or brick.kind != K.L_MORT_ANN:
+                continue
+            
+            # Convert LMortgageSpec to dict for strategy compatibility
+            if isinstance(brick.spec, LMortgageSpec):
+                brick.spec = brick.spec.__dict__.copy()
+                
+            # Handle legacy auto_principal_from
+            if "auto_principal_from" in (brick.links or {}):
+                warnings.warn(
+                    f"Deprecated: auto_principal_from on {brick.id}. "
+                    "Use PrincipalLink(from_house=...) instead.",
+                    DeprecationWarning,
+                    stacklevel=2
+                )
+                if "principal" not in (brick.links or {}):
+                    brick.links = brick.links or {}
+                    brick.links["principal"] = PrincipalLink(
+                        from_house=brick.links["auto_principal_from"]
+                    ).__dict__
+            
+            # Handle legacy duration_m for mortgages
+            if hasattr(brick, 'duration_m') and brick.duration_m is not None:
+                warnings.warn(
+                    f"Deprecated: duration_m on mortgage {brick.id}. "
+                    "Use fix_rate_months instead.",
+                    DeprecationWarning,
+                    stacklevel=2
+                )
+                
+                if brick.spec.get("fix_rate_months") is None:
+                    brick.spec["fix_rate_months"] = brick.duration_m
+                elif brick.spec.get("fix_rate_months") != brick.duration_m:
+                    raise ConfigError(
+                        f"Conflict on {brick.id}: duration_m={brick.duration_m} "
+                        f"vs fix_rate_months={brick.spec.get('fix_rate_months')}"
+                    )
+        
+        # Resolve start dates
+        self._resolve_start_dates(brick_registry)
+        
+        # Resolve principals
+        self._resolve_principals(brick_registry)
+        
+        # Validate settlement buckets
+        self._validate_settlement_buckets(brick_registry)
+    
+    def _resolve_start_dates(self, brick_registry: Dict[str, FinBrickABC]) -> None:
+        """Resolve start dates from StartLink references."""
+        for brick in self.bricks:
+            if not hasattr(brick, 'links') or not brick.links:
+                continue
+                
+            start_link_data = brick.links.get("start")
+            if not start_link_data:
+                continue
+                
+            start_link = StartLink(**start_link_data)
+            
+            # Calculate start date from reference
+            if start_link.on_fix_end_of:
+                ref_brick = brick_registry.get(start_link.on_fix_end_of)
+                if not ref_brick:
+                    raise ConfigError(f"StartLink references unknown brick: {start_link.on_fix_end_of}")
+                if not isinstance(ref_brick, LBrick) or ref_brick.kind != K.L_MORT_ANN:
+                    raise ConfigError(f"StartLink on_fix_end_of must reference a mortgage: {start_link.on_fix_end_of}")
+                
+                # Calculate fix end date
+                ref_start = ref_brick.start_date
+                ref_spec = ref_brick.spec
+                if isinstance(ref_spec, LMortgageSpec) and ref_spec.fix_rate_months:
+                    fix_end = ref_start + pd.DateOffset(months=ref_spec.fix_rate_months - 1)
+                else:
+                    # Fallback to brick end
+                    fix_end = ref_start + pd.DateOffset(months=(getattr(brick, 'duration_m', 12) or 12) - 1)
+                
+                calculated_start = fix_end + pd.DateOffset(months=start_link.offset_m)
+                
+            elif start_link.on_end_of:
+                ref_brick = brick_registry.get(start_link.on_end_of)
+                if not ref_brick:
+                    raise ConfigError(f"StartLink references unknown brick: {start_link.on_end_of}")
+                
+                # Calculate end date
+                ref_start = ref_brick.start_date
+                ref_duration = getattr(ref_brick, 'duration_m', 12) or 12
+                ref_end = ref_start + pd.DateOffset(months=ref_duration - 1)
+                calculated_start = ref_end + pd.DateOffset(months=start_link.offset_m)
+            else:
+                continue
+            
+            # Validate against explicit start_date if provided
+            if brick.start_date is not None:
+                if brick.start_date != calculated_start:
+                    raise ConfigError(
+                        f"Start date conflict on {brick.id}: "
+                        f"explicit={brick.start_date} vs calculated={calculated_start}"
+                    )
+            else:
+                brick.start_date = calculated_start
+    
+    def _resolve_principals(self, brick_registry: Dict[str, FinBrickABC]) -> None:
+        """Resolve principal amounts from PrincipalLink references."""
+        for brick in self.bricks:
+            if not isinstance(brick, LBrick) or brick.kind != K.L_MORT_ANN:
+                continue
+                
+            if not hasattr(brick, 'links') or not brick.links:
+                continue
+                
+            principal_link_data = brick.links.get("principal")
+            if not principal_link_data:
+                continue
+                
+            principal_link = PrincipalLink(**principal_link_data)
+            
+            # Calculate principal from reference
+            if principal_link.from_house:
+                house_brick = brick_registry.get(principal_link.from_house)
+                if not house_brick:
+                    raise ConfigError(f"PrincipalLink references unknown house: {principal_link.from_house}")
+                if not isinstance(house_brick, ABrick) or house_brick.kind != K.A_PROPERTY:
+                    raise ConfigError(f"PrincipalLink from_house must reference a property: {principal_link.from_house}")
+                
+                # Extract house data
+                house_spec = house_brick.spec
+                price = float(house_spec.get("price", 0))
+                down_payment = float(house_spec.get("down_payment", 0))
+                fees_pct = float(house_spec.get("fees_pct", 0))
+                finance_fees = bool(house_spec.get("finance_fees", False))
+                
+                # Calculate principal
+                principal = price - down_payment
+                if finance_fees:
+                    principal += price * fees_pct
+                
+                # Store resolved principal for later use
+                brick.spec["principal"] = principal
+                
+            elif principal_link.nominal is not None:
+                # Direct nominal amount
+                brick.spec["principal"] = principal_link.nominal
+    
+    def _validate_settlement_buckets(self, brick_registry: Dict[str, FinBrickABC]) -> None:
+        """Validate settlement buckets for remaining_of links."""
+        # Group contributors by remaining_of target
+        settlement_buckets = {}
+        
+        for brick in self.bricks:
+            if not isinstance(brick, LBrick) or brick.kind != K.L_MORT_ANN:
+                continue
+                
+            if not hasattr(brick, 'links') or not brick.links:
+                continue
+                
+            principal_link_data = brick.links.get("principal")
+            if not principal_link_data:
+                continue
+                
+            principal_link = PrincipalLink(**principal_link_data)
+            
+            if principal_link.remaining_of:
+                target_id = principal_link.remaining_of
+                if target_id not in settlement_buckets:
+                    settlement_buckets[target_id] = []
+                settlement_buckets[target_id].append((brick, principal_link))
+        
+        # Validate each settlement bucket
+        for target_id, contributors in settlement_buckets.items():
+            target_brick = brick_registry.get(target_id)
+            if not target_brick:
+                raise ConfigError(f"Settlement bucket references unknown brick: {target_id}")
+            
+            # For now, we'll validate the structure but defer actual amount calculation
+            # until we have the remaining balance from the target brick's simulation
+            total_nominal = sum(
+                c[1].nominal or 0 for c in contributors if c[1].nominal is not None
+            )
+            total_share = sum(
+                c[1].share or 0 for c in contributors if c[1].share is not None
+            )
+            fill_remaining_count = sum(
+                1 for c in contributors if c[1].fill_remaining
+            )
+            
+            # Basic validation
+            if total_share > 1.0:
+                raise ConfigError(f"Settlement bucket {target_id}: total share {total_share} > 1.0")
+            
+            if fill_remaining_count > 1:
+                raise ConfigError(f"Settlement bucket {target_id}: multiple fill_remaining=True")
+            
+            # Store settlement info for later validation during simulation
+            for brick, principal_link in contributors:
+                if not hasattr(brick, '_settlement_info'):
+                    brick._settlement_info = []
+                brick._settlement_info.append({
+                    'target_id': target_id,
+                    'share': principal_link.share,
+                    'nominal': principal_link.nominal,
+                    'fill_remaining': principal_link.fill_remaining
+                })
     
     def _find_start_index(self, start_date: date, t_index: np.ndarray) -> Optional[int]:
         """
@@ -1140,7 +1434,6 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
     
     # 5) Liquidity constraints (only if we have bricks)
     if bricks is not None:
-        from .kinds import K
         for b in bricks:
             if isinstance(b, ABrick) and b.kind == K.A_CASH:
                 bal = outputs[b.id]["asset_value"]
@@ -1165,7 +1458,6 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
     
     # 6) Balloon payment validation (only if we have bricks)
     if bricks is not None:
-        from .kinds import K
         for b in bricks:
             if isinstance(b, LBrick) and b.kind == K.L_MORT_ANN:
                 # Check if this mortgage has a balloon policy
@@ -1235,7 +1527,6 @@ def validate_run(res: dict, bricks=None, mode: str = "raise", tol: float = 1e-6)
     
     # 9) Window-end equity identity validation
     if bricks is not None:
-        from .kinds import K
         for b in bricks:
             if isinstance(b, (ABrick, LBrick)):
                 mask = active_mask(res["totals"].index, b.start_date, b.end_date, b.duration_m)
